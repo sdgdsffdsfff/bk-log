@@ -21,110 +21,101 @@
   -->
 
 <template>
-  <section class="manage-wrapper">
-    <top-nav :title="title" :menu="menu"></top-nav>
-    <router-view class="manage-container" :key="$route.fullPath"></router-view>
-  </section>
+  <div class="manage-container">
+    <div class="manage-main" v-if="!pageLoading">
+      <sub-nav></sub-nav>
+      <router-view class="manage-content" :key="routerKey"></router-view>
+    </div>
+  </div>
 </template>
 
 <script>
 import { mapState, mapGetters } from 'vuex';
-import topNav from '@/components/nav/top-nav';
+import SubNav from '@/components/nav/manage-nav';
+
 export default {
   name: 'manage-index',
   components: {
-    topNav,
+    SubNav,
   },
   data() {
     return {
-      title: '',
-      menu: null,
+      navThemeColor: '#2c354d',
+      routerKey: 0,
+      isExpand: true,
     };
   },
   computed: {
-    ...mapState({
-      menuList: state => state.menuList,
-      currentMenu: state => state.currentMenu,
+    ...mapState(['topMenu', 'activeManageNav']),
+    ...mapState('globals', ['globalsData']),
+    ...mapGetters({
+      pageLoading: 'pageLoading',
     }),
-    ...mapGetters('globals', ['globalsData']),
-  },
-  watch: {
-    '$route.name'(newVal) {
-      this.getMenu(this.menuList, newVal);
+    manageNavList() {
+      return this.topMenu.find(item => item.id === 'manage')?.children || [];
     },
   },
   created() {
     this.getGlobalsData();
-    this.getMenu(this.menuList, this.$route.name);
   },
   methods: {
-    getMenu(menuList, route, parent) {
-      menuList.forEach((item) => {
-        if (item.id === route) {
-          if (parent) {
-            const menu = JSON.parse(JSON.stringify(parent === true ? item : parent));
-            if (menu.id === 'indexSet') {
-              delete menu.children;
-            }
-            this.menu = menu;
-            if (parent.id === 'manage') {
-              this.title = item.level === 4 ? item.name : item.level === 5 ? item.name : '';
-            } else if (parent.id === 'indexSet') {
-              this.title = item.level === 3 ? item.name : '';
-            } else {
-              this.title = '';
-            }
-            // 如需要，可以将title存入store，方便做同路由返回操作。
-          }
-        } else if (item.id !== route && item.children) {
-          this.getMenu(item.children, route, item.dropDown ? item.dropDown : (parent === true ? item : parent));
-        }
+    getMenuIcon(item) {
+      if (item.icon) {
+        return `log-icon icon-${item.icon}`;
+      }
+
+      return 'bk-icon icon-home-shape';
+    },
+    handleClickNavItem(id) {
+      this.$router.push({
+        name: id,
+        query: {
+          projectId: window.localStorage.getItem('project_id'),
+        },
       });
+      if (this.activeManageNav.id === id) {
+        // this.routerKey += 1;
+      }
     },
     // 获取全局数据
     getGlobalsData() {
-      return new Promise((resolve, reject) => {
-        this.$http.request('collect/globals', { query: {} }).then((res) => {
-          if (res.data) {
-            const globalsData = res.data || {};
-            this.$store.commit('globals/setGlobalsData', globalsData);
-            resolve(res.data);
-          }
-        })
-          .catch((err) => {
-            reject(err);
-          });
-      });
+      if (Object.keys(this.globalsData).length) {
+        return;
+      }
+      this.$http.request('collect/globals').then((res) => {
+        this.$store.commit('globals/setGlobalsData', res.data);
+      })
+        .catch((e) => {
+          console.warn(e);
+        });
+    },
+    handleToggle(data) {
+      this.isExpand = data;
     },
   },
 };
 </script>
 
-<style lang="scss">
-  @import '../../scss/mixins/scroller.scss';
-
-  .manage-wrapper {
-    min-width: 1280px;
+<style lang="scss" scoped>
+@import '../../scss/mixins/scroller.scss';
+.manage-container {
+  height: 100%;
+  .manage-content {
+      height: calc(100% - 52px);
+      overflow: auto;
+      @include scroller($backgroundColor: #C4C6CC, $width: 4px);
+    }
+  .manage-main {
     height: 100%;
   }
-
-  .manage-container {
-    height: calc(100% - 60px);
-    overflow-x: hidden;
-    overflow-y: auto;
-
-    @include scroller($backgroundColor: #c4c6cc, $width: 8px);
-
-    .bk-table {
-      background: #fff;
-
-      .bk-table-pagination-wrapper {
-        background: #fafbfd;
-      }
+  /deep/ .bk-table {
+    background: #fff;
+    .cell {
+      display: block;
+    }
+    .bk-table-pagination-wrapper {
+      background: #fafbfd;
     }
   }
-
-  .bk-table .cell {
-    display: block;
-  }
+}
 </style>

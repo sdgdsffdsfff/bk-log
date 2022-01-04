@@ -22,12 +22,35 @@ from django.utils.translation import ugettext_lazy as _
 
 from apps.utils import ChoicesEnum
 
+META_PARAMS_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+RESTORE_INDEX_SET_PREFIX = "restore_"
+
 BKLOG_RESULT_TABLE_PATTERN = fr"(\d*?_{settings.TABLE_ID_PREFIX}_.*)_.*_.*"
 
 NOT_FOUND_CODE = "[404]"
 
 # ESB返回节点管理check_task_ready API 404异常或非json内容
 CHECK_TASK_READY_NOTE_FOUND_EXCEPTION_CODE = "1306201"
+
+COLLECTOR_CONFIG_NAME_EN_REGEX = r"^[A-Za-z0-9_]+$"
+
+
+class EsSourceType(ChoicesEnum):
+    OTHER = "other"
+    PRIVATE = "private"
+    AWS = "aws"
+    QCLOUD = "qcloud"
+    ALIYUN = "aliyun"
+    GOOGLE = "google"
+
+    _choices_labels = (
+        (OTHER, _("其他")),
+        (AWS, _("AWS")),
+        (QCLOUD, _("腾讯云")),
+        (ALIYUN, _("阿里云")),
+        (GOOGLE, _("google")),
+        (PRIVATE, _("私有自建")),
+    )
 
 
 class StrategyKind(ChoicesEnum):
@@ -88,6 +111,21 @@ INTERNAL_TOPO_INDEX = 0
 
 # biz_topo空闲节点默认index
 BIZ_TOPO_INDEX = 0
+
+# 高级清洗创建索引集默认时间格式
+DEFAULT_TIME_FORMAT = _("微秒（microsecond）")
+# 高级清洗默认创建业务应用型索引集
+DEFAULT_CATEGORY_ID = "application_check"
+DEFAULT_ETL_CONFIG = "bkdata_clean"
+
+# 同步清洗最长ttl时间 60*10
+MAX_SYNC_CLEAN_TTL = 600
+
+
+class AsyncStatus(object):
+    RUNNING = "RUNNING"
+    DONE = "DONE"
+
 
 FIELD_TEMPLATE = {
     "field_name": "",
@@ -207,3 +245,15 @@ NODE_ATTR_PREFIX_BLACKLIST = [
     "ml.",
     "xpack.",
 ]
+
+BKDATA_ES_TYPE_MAP = {
+    "integer": "int",
+    "long": "long",
+    "keyword": "string",
+    "text": "text",
+    "double": "double",
+    "object": "text",
+    "nested": "text",
+}
+
+ETL_PARAMS = {"retain_original_text": True, "separator_regexp": "", "separator": ""}

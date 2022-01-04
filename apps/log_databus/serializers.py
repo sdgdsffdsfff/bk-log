@@ -17,12 +17,15 @@ NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
+from django.conf import settings
 from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
 from apps.exceptions import ValidationError
 from apps.generic import DataModelSerializer
-from apps.log_databus.models import CollectorConfig
+from apps.log_databus.constants import COLLECTOR_CONFIG_NAME_EN_REGEX
+from apps.log_databus.models import CleanTemplate, CollectorConfig
 
+from apps.log_databus.constants import EsSourceType
 from apps.log_search.constants import (
     CollectorScenarioEnum,
     EncodingsEnum,
@@ -30,6 +33,7 @@ from apps.log_search.constants import (
     ConditionTypeEnum,
     EtlConfigEnum,
     FieldBuiltInEnum,
+    CustomTypeEnum,
 )
 
 
@@ -120,7 +124,7 @@ class PluginParamSerializer(serializers.Serializer):
     插件参数序列化
     """
 
-    paths = serializers.ListField(label=_("日志路径"), child=serializers.CharField(max_length=255))
+    paths = serializers.ListField(label=_("日志路径"), child=serializers.CharField(max_length=255), required=False)
     conditions = PluginConditionSerializer(required=False)
     multiline_pattern = serializers.CharField(label=_("行首正则"), required=False)
     multiline_max_lines = serializers.IntegerField(label=_("最多匹配行数"), required=False, max_value=1000)
@@ -133,6 +137,16 @@ class PluginParamSerializer(serializers.Serializer):
     close_inactive = serializers.IntegerField(label=_("FD关联间隔"), required=False, min_value=1)
     harvester_limit = serializers.IntegerField(label=_("同时采集数"), required=False, min_value=1)
     clean_inactive = serializers.IntegerField(label=_("采集进度清理时间"), required=False, min_value=1)
+
+    winlog_name = serializers.ListField(
+        label=_("windows事件名称"), child=serializers.CharField(max_length=255), required=False
+    )
+    winlog_level = serializers.ListField(
+        label=_("windows事件等级"), child=serializers.CharField(max_length=255), required=False
+    )
+    winlog_event_id = serializers.ListField(
+        label=_("windows事件ID"), child=serializers.CharField(max_length=255), required=False
+    )
 
 
 class DataLinkListSerializer(serializers.Serializer):
@@ -161,13 +175,50 @@ class ClusterListSerializer(serializers.Serializer):
     cluster_type = serializers.CharField(label=_("集群种类"), required=True)
 
 
+class CustomCreateSerializer(serializers.Serializer):
+    bk_biz_id = serializers.IntegerField(label=_("业务ID"))
+    collector_config_name = serializers.CharField(label=_("采集名称"), max_length=50)
+    collector_config_name_en = serializers.RegexField(
+        label=_("采集英文名称"), min_length=5, max_length=50, regex=COLLECTOR_CONFIG_NAME_EN_REGEX
+    )
+    data_link_id = serializers.CharField(label=_("数据链路id"), required=False, allow_blank=True, allow_null=True)
+    custom_type = serializers.ChoiceField(label=_("日志类型"), choices=CustomTypeEnum.get_choices())
+    category_id = serializers.CharField(label=_("分类ID"))
+    storage_cluster_id = serializers.IntegerField(label=_("集群ID"), required=True)
+    retention = serializers.IntegerField(label=_("有效时间"), required=True)
+    allocation_min_days = serializers.IntegerField(label=_("冷热数据生效时间"), required=True)
+    storage_replies = serializers.IntegerField(
+        label=_("ES副本数量"), required=False, default=settings.ES_REPLICAS, min_value=0, max_value=3
+    )
+    description = serializers.CharField(
+        label=_("备注说明"), max_length=64, required=False, allow_null=True, allow_blank=True
+    )
+
+
+class CustomUpateSerializer(serializers.Serializer):
+    collector_config_name = serializers.CharField(label=_("采集名称"), max_length=50)
+    category_id = serializers.CharField(label=_("分类ID"))
+    description = serializers.CharField(
+        label=_("备注说明"), max_length=64, required=False, allow_null=True, allow_blank=True
+    )
+    storage_cluster_id = serializers.IntegerField(label=_("集群ID"), required=True)
+    retention = serializers.IntegerField(label=_("有效时间"), required=True)
+    allocation_min_days = serializers.IntegerField(label=_("冷热数据生效时间"), required=True)
+    storage_replies = serializers.IntegerField(
+        label=_("ES副本数量"), required=False, default=settings.ES_REPLICAS, min_value=0, max_value=3
+    )
+
+
 class CollectorCreateSerializer(serializers.Serializer):
     """
     创建采集项序列化
     """
 
     bk_biz_id = serializers.IntegerField(label=_("业务ID"))
-    collector_config_name = serializers.CharField(label=_("采集名称"))
+    collector_config_name = serializers.CharField(label=_("采集名称"), max_length=50)
+    collector_config_name_en = serializers.RegexField(
+        label=_("采集英文名称"), min_length=5, max_length=50, regex=COLLECTOR_CONFIG_NAME_EN_REGEX
+    )
     data_link_id = serializers.CharField(label=_("数据链路id"), required=False, allow_blank=True, allow_null=True)
     collector_scenario_id = serializers.ChoiceField(label=_("日志类型"), choices=CollectorScenarioEnum.get_choices())
     category_id = serializers.CharField(label=_("分类ID"))
@@ -185,6 +236,11 @@ class CollectorCreateSerializer(serializers.Serializer):
             for field in ["multiline_pattern", "multiline_max_lines", "multiline_timeout"]:
                 if field not in attrs["params"]:
                     raise ValidationError(_("{} 该字段为必填项").format(field))
+
+        if attrs["collector_scenario_id"] == "wineventlog":
+            for field in ["winlog_name"]:
+                if field not in attrs["params"]:
+                    raise ValidationError(_("{} 该字段为必填项").format(field))
         return attrs
 
 
@@ -193,7 +249,10 @@ class CollectorUpdateSerializer(serializers.Serializer):
     更新采集项序列化
     """
 
-    collector_config_name = serializers.CharField(label=_("采集名称"))
+    collector_config_name = serializers.CharField(label=_("采集名称"), max_length=50)
+    collector_config_name_en = serializers.RegexField(
+        label=_("采集英文名称"), min_length=5, max_length=50, regex=COLLECTOR_CONFIG_NAME_EN_REGEX
+    )
     target_object_type = serializers.CharField(label=_("目标类型"))
     target_node_type = serializers.CharField(label=_("节点类型"))
     target_nodes = TargetNodeSerializer(label=_("目标节点"), many=True)
@@ -271,6 +330,8 @@ class CollectorListSerializer(DataModelSerializer):
     target_nodes = serializers.JSONField(label=_("采集目标"))
     task_id_list = serializers.JSONField(label=_("任务ID列表"))
     target_subscription_diff = serializers.JSONField(label=_("订阅目标变更情况"))
+    create_clean_able = serializers.BooleanField(label=_("是否可以创建基础清洗"))
+    bkdata_index_set_ids = serializers.ListField(child=serializers.IntegerField(), label=_("数据平台索引集id列表"))
 
     class Meta:
         model = CollectorConfig
@@ -310,6 +371,11 @@ class StorageCreateSerializer(serializers.Serializer):
     hot_attr_value = serializers.CharField(label=_("热节点属性值"), default="", allow_blank=True)
     warm_attr_name = serializers.CharField(label=_("冷节点属性名称"), default="", allow_blank=True)
     warm_attr_value = serializers.CharField(label=_("冷节点属性值"), default="", allow_blank=True)
+    source_type = serializers.ChoiceField(label=_("ES来源类型"), choices=EsSourceType.get_choices())
+    source_name = serializers.CharField(label=_("来源名称"), required=False)
+    visible_bk_biz = serializers.ListField(
+        label=_("可见业务范围"), child=serializers.IntegerField(), required=False, default=[]
+    )
 
     def validate(self, attrs):
         if not attrs["enable_hot_warm"]:
@@ -318,6 +384,9 @@ class StorageCreateSerializer(serializers.Serializer):
             [attrs["hot_attr_name"], attrs["hot_attr_value"], attrs["warm_attr_name"], attrs["warm_attr_value"]]
         ):
             raise ValidationError(_("当冷热数据处于开启状态时，冷热节点属性配置不能为空"))
+        if attrs["source_type"] in [EsSourceType.OTHER.value]:
+            if not attrs.get("source_name"):
+                raise ValidationError(_("当来源类型为其他时，需要传入来源名称"))
         return attrs
 
 
@@ -356,6 +425,11 @@ class StorageUpdateSerializer(serializers.Serializer):
     hot_attr_value = serializers.CharField(label=_("热节点属性值"), default="", allow_blank=True)
     warm_attr_name = serializers.CharField(label=_("冷节点属性名称"), default="", allow_blank=True)
     warm_attr_value = serializers.CharField(label=_("冷节点属性值"), default="", allow_blank=True)
+    source_type = serializers.ChoiceField(label=_("ES来源类型"), choices=EsSourceType.get_choices())
+    source_name = serializers.CharField(label=_("来源名称"), required=False)
+    visible_bk_biz = serializers.ListField(
+        label=_("可见业务范围"), child=serializers.IntegerField(), required=False, default=[]
+    )
 
     def validate(self, attrs):
         if not attrs["enable_hot_warm"]:
@@ -364,6 +438,10 @@ class StorageUpdateSerializer(serializers.Serializer):
             [attrs["hot_attr_name"], attrs["hot_attr_value"], attrs["warm_attr_name"], attrs["warm_attr_value"]]
         ):
             raise ValidationError(_("当冷热数据处于开启状态时，冷热节点属性配置不能为空"))
+
+        if attrs["source_type"] in [EsSourceType.OTHER.value]:
+            if not attrs.get("source_name"):
+                raise ValidationError(_("当来源类型为其他时，需要传入来源名称"))
         return attrs
 
 
@@ -435,10 +513,10 @@ class CollectorEtlFieldsSerializer(serializers.Serializer):
             raise ValidationError(_("时间字段需配置时区、格式"))
 
         if field["field_type"] in ["int", "long"]:
-            if field["option"]["time_format"] not in ["epoch_millis", "epoch_second", "epoch_minute"]:
+            if field["option"]["time_format"] not in ["epoch_millis", "epoch_second", "epoch_minute", "epoch_micros"]:
                 raise ValidationError(_("时间字段类型与格式不匹配"))
         else:
-            if field["option"]["time_format"] in ["epoch_millis", "epoch_second", "epoch_minute"]:
+            if field["option"]["time_format"] in ["epoch_millis", "epoch_second", "epoch_minute", "epoch_micros"]:
                 raise ValidationError(_("时间字段类型与格式不匹配"))
         return True
 
@@ -451,6 +529,9 @@ class CollectorEtlStorageSerializer(serializers.Serializer):
     storage_cluster_id = serializers.IntegerField(label=_("集群ID"), required=True)
     retention = serializers.IntegerField(label=_("有效时间"), required=True)
     allocation_min_days = serializers.IntegerField(label=_("冷热数据生效时间"), required=True)
+    storage_replies = serializers.IntegerField(
+        label=_("ES副本数量"), required=False, default=settings.ES_REPLICAS, min_value=0, max_value=3
+    )
     view_roles = serializers.ListField(label=_("查看权限"), required=False, default=[])
 
     def validate(self, attrs):
@@ -523,3 +604,116 @@ class ListCollectorsByHostSerializer(serializers.Serializer):
     bk_cloud_id = serializers.IntegerField(label=_("云区域Id"), required=False, default=0)
     bk_host_id = serializers.IntegerField(label=_("主机id"), required=False)
     bk_biz_id = serializers.IntegerField(label=_("业务id"), required=True)
+
+
+class CleanSerializer(serializers.Serializer):
+    bk_biz_id = serializers.IntegerField(label=_("业务id"))
+    keyword = serializers.CharField(label=_("检索关键词"), required=False)
+    etl_config = serializers.CharField(label=_("清洗配置类型"), required=False)
+    page = serializers.IntegerField(label=_("页码"))
+    pagesize = serializers.IntegerField(label=_("页面大小"))
+
+    def validate(self, attrs):
+        super().validate(attrs)
+        if attrs["page"] < 0 or attrs["pagesize"] < 0:
+            raise ValidationError(_("分页参数不能为负数"))
+        return attrs
+
+
+class PageSerializer(serializers.Serializer):
+    page = serializers.IntegerField(label=_("页码"))
+    pagesize = serializers.IntegerField(label=_("页面大小"))
+
+    def validate(self, attrs):
+        super().validate(attrs)
+        if attrs["page"] < 0 or attrs["pagesize"] < 0:
+            raise ValidationError(_("分页参数不能为负数"))
+        return attrs
+
+
+class CleanRefreshSerializer(serializers.Serializer):
+    bk_biz_id = serializers.IntegerField(label=_("业务id"))
+    bk_data_id = serializers.IntegerField(label=_("数据源id"))
+
+
+class CleanSyncSerializer(serializers.Serializer):
+    bk_biz_id = serializers.IntegerField(label=_("业务id"))
+    polling = serializers.BooleanField(label=_("是否是轮询请求"), required=False, default=False)
+
+
+class CleanTemplateSerializer(serializers.Serializer):
+    name = serializers.CharField(label=_("清洗模板名"), required=True)
+    clean_type = serializers.CharField(label=_("清洗类型"), required=True)
+    etl_params = serializers.DictField(label=_("清洗配置"), required=True)
+    etl_fields = serializers.ListField(child=serializers.DictField(), label=_("字段配置"), required=True)
+    bk_biz_id = serializers.IntegerField(label=_("业务id"), required=True)
+
+
+class CleanStashSerializer(serializers.Serializer):
+    clean_type = serializers.CharField(label=_("清洗类型"), required=True)
+    etl_params = serializers.DictField(label=_("清洗配置"), required=True)
+    etl_fields = serializers.ListField(child=serializers.DictField(), label=_("字段配置"), required=True)
+    bk_biz_id = serializers.IntegerField(label=_("业务id"), required=True)
+
+
+class CleanTemplateListSerializer(DataModelSerializer):
+    class Meta:
+        model = CleanTemplate
+        fields = "__all__"
+
+
+class StorageRepositorySerlalizer(serializers.Serializer):
+    bk_biz_id = serializers.IntegerField(label=_("业务ID"), required=True)
+
+
+class ListArhiveSwitchSerlalizer(serializers.Serializer):
+    bk_biz_id = serializers.IntegerField(label=_("业务ID"), required=True)
+
+
+class ListArchiveSerlalizer(serializers.Serializer):
+    bk_biz_id = serializers.IntegerField(label=_("业务ID"), required=False)
+    page = serializers.IntegerField(label=_("分页page"), required=True)
+    pagesize = serializers.IntegerField(label=_("分页pagesize"), required=True)
+
+
+class CreateArchiveSerlalizer(serializers.Serializer):
+    collector_config_id = serializers.IntegerField(required=True, label=_("采集项id"))
+    target_snapshot_repository_name = serializers.CharField(required=True, label=_("目标es集群快照仓库"))
+    snapshot_days = serializers.IntegerField(required=True, label=_("快照存储时间配置"), min_value=0)
+    bk_biz_id = serializers.IntegerField(label=_("业务ID"), required=True)
+
+
+class UpdateArchiveSerlalizer(serializers.Serializer):
+    snapshot_days = serializers.IntegerField(required=True, label=_("快照存储时间配置"), min_value=0)
+
+
+class RestoreArchiveSerlalizer(serializers.Serializer):
+    archive_config_id = serializers.IntegerField(label=_("业务ID"), required=True)
+    bk_biz_id = serializers.IntegerField(label=_("业务ID"), required=True)
+    index_set_name = serializers.CharField(label=_("索引集名称"), required=True)
+    start_time = serializers.DateTimeField(required=True, label=_("数据开始时间"), format="%Y-%m-%d %H:%M:%S")
+    end_time = serializers.DateTimeField(required=True, label=_("数据结束时间"), format="%Y-%m-%d %H:%M:%S")
+    expired_time = serializers.DateTimeField(required=True, label=_("指定过期时间"), format="%Y-%m-%d %H:%M:%S")
+    notice_user = serializers.ListField(required=True, label=_("通知人"))
+
+
+class UpdateRestoreArchiveSerlalizer(serializers.Serializer):
+    expired_time = serializers.DateTimeField(required=True, label=_("指定过期时间"), format="%Y-%m-%d %H:%M:%S")
+
+
+class DeleteRestoreArchiveSerlalizer(serializers.Serializer):
+    restore_config_id = serializers.IntegerField(label=_("回溯id"))
+
+
+class ListRestoreSerlalizer(ListArchiveSerlalizer):
+    bk_biz_id = serializers.IntegerField(label=_("业务ID"), required=False)
+    page = serializers.IntegerField(label=_("分页page"), required=True)
+    pagesize = serializers.IntegerField(label=_("分页pagesize"), required=True)
+
+
+class ListCollectorSerlalizer(serializers.Serializer):
+    bk_biz_id = serializers.IntegerField(label=_("业务ID"), required=True)
+
+
+class BatchGetStateSerlalizer(serializers.Serializer):
+    restore_config_ids = serializers.ListField(label=_("归档回溯配置list"), required=True)

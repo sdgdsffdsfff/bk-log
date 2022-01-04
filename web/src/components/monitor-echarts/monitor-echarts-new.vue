@@ -21,18 +21,10 @@
   -->
 
 <template>
-  <div class="monitor-echart-wrap"
-       :style="{ 'background-image': backgroundUrl }"
-       v-bkloading="{ isLoading: loading, zIndex: 2000 }">
-    <div class="echart-header" v-if="chartTitle || $slots.title">
-      <chart-title
-        :title="chartTitle"
-        :subtitle="chartSubTitle"
-        :menu-list="chartOption.tool.list"
-        @toggle-expand="handleToggleExpand"
-        @menu-click="handleMoreToolItemSet">
-      </chart-title>
-    </div>
+  <div 
+    class="monitor-echart-wrap"
+    :style="{ 'background-image': backgroundUrl }"
+    v-bkloading="{ isLoading: false, zIndex: 2000 }">
     <div v-show="!isFold">
       <div class="chart-wrapper"
           tabindex="-1"
@@ -134,7 +126,6 @@ export default class MonitorEcharts extends Vue {
     }
   })
   backgroundUrl: String
-  isFold: Boolean = localStorage.getItem('chartIsFold') === 'true'
 
   // 获取图标数据
   @Prop() getSeriesData: (timeFrom?: string, timeTo?: string, range?: boolean) => Promise<void>
@@ -212,6 +203,8 @@ export default class MonitorEcharts extends Vue {
   @Prop({ default: 165 }) height: number | string
   @Prop({ default: 1, type: Number }) lineWidth: number
 
+  @Prop({ default: localStorage.getItem('chartIsFold') === 'true' }) isFold: boolean
+
   // chart: Echarts.ECharts = null
   resizeHandler: ResizeCallback<HTMLDivElement>
   unwatchOptions: () => void
@@ -239,8 +232,11 @@ export default class MonitorEcharts extends Vue {
   curChartOption: any
   chart = null
   clickTimer = null
+  timer = null
+  isFinish = true
   chartInView: ChartInView = null
   initStatus: Boolean = true
+  chartData: any = []
   // 监控图表默认配置
   get defaultOptions() {
     if (['bar', 'line'].includes(this.chartType)) {
@@ -335,6 +331,10 @@ export default class MonitorEcharts extends Vue {
   get isEchartsRender() {
     return !['status', 'text'].includes(this.chartType)
   }
+  @Watch('loading')
+  onLoadingChange(v) {
+    this.$emit('chart-loading', this.loading)
+  }
   @Watch('height')
   onHeightChange() {
     this.chart && this.chart.resize()
@@ -357,10 +357,7 @@ export default class MonitorEcharts extends Vue {
   mounted() {
     if (this.isFold) {
       this.chartTitle = this.title
-      return
     }
-
-    this.initStatus = false
     this.init()
   }
 
@@ -393,6 +390,8 @@ export default class MonitorEcharts extends Vue {
     }
     this.annotation.show = false
     this.refleshIntervalInstance && window.clearInterval(this.refleshIntervalInstance)
+    clearTimeout(this.timer)
+    this.timer = null
   }
   destroyed() {
     this.chart && this.destroy()
@@ -407,16 +406,28 @@ export default class MonitorEcharts extends Vue {
       //   // eslint-disable-next-line @typescript-eslint/no-require-imports
       //   require('./map/china')
       // }
-      const chart: any = echarts.init(this.chartRef)
-      this.chart = chart
-      if (this.autoresize) {
-        const handler = debounce(300, false, () => this.resize())
-        this.resizeHandler = async () => {
-          await this.$nextTick()
-          this.chartRef && this.chartRef.offsetParent !== null && handler()
+      if (this.chartRef) {
+        const chart: any = echarts.init(this.chartRef)
+        this.chart = chart
+        if (this.autoresize) {
+          const handler = debounce(300, false, () => this.resize())
+          this.resizeHandler = async () => {
+            await this.$nextTick()
+            this.chartRef && this.chartRef.offsetParent !== null && handler()
+          }
+          addListener(this.chartRef, this.resizeHandler)
         }
-        addListener(this.chartRef, this.resizeHandler)
       }
+      // const chart: any = echarts.init(this.chartRef)
+      // this.chart = chart
+      // if (this.autoresize) {
+      //   const handler = debounce(300, false, () => this.resize())
+      //   this.resizeHandler = async () => {
+      //     await this.$nextTick()
+      //     this.chartRef && this.chartRef.offsetParent !== null && handler()
+      //   }
+      //   addListener(this.chartRef, this.resizeHandler)
+      // }
     }
     this.initPropsWatcher()
   }
@@ -425,45 +436,77 @@ export default class MonitorEcharts extends Vue {
     this.intersectionObserver = new IntersectionObserver((entries) => {
       entries.forEach((entry) => {
         if (this.needObserver) {
-          if (entry.intersectionRatio > 0) {
-            this.handleSeriesData()
-          } else {
-            // 解决临界点、慢滑不加载数据问题
-            const { top, bottom } = this.$el.getBoundingClientRect()
-            if (top === 0 && bottom === 0) return
-            const { innerHeight } = window
-            const isVisiable = (top > 0 && top <= innerHeight) || (bottom >= 0 && bottom < innerHeight)
-            isVisiable && this.handleSeriesData()
-          }
+          // if (entry.intersectionRatio > 0) {
+          //   this.handleSeriesData()
+          // } else {
+          //   // 解决临界点、慢滑不加载数据问题
+          //   const { top, bottom } = this.$el.getBoundingClientRect()
+          //   if (top === 0 && bottom === 0) return
+          //   const { innerHeight } = window
+          //   const isVisiable = (top > 0 && top <= innerHeight) || (bottom >= 0 && bottom < innerHeight)
+          //   isVisiable && this.handleSeriesData()
+          // }
+          this.handleSeriesData()
         }
       })
     })
   }
 
+  // 终止轮询
+  handleCloseTimer() {
+    if (this.timer) {
+      this.isFinish = true
+      clearTimeout(this.timer)
+    }
+  }
+
+  handleChangeInterval() {
+    this.isFinish = true
+    clearTimeout(this.timer)
+    this.timer = null
+    setTimeout(() => {
+      this.handleSeriesData()
+    }, 500);
+  }
+
   // 获取seriesData
   async handleSeriesData(startTime?: string, endTime?: string) {
-    this.loading = true
+    if (this.isFinish) this.loading = true
+
     this.intersectionObserver && this.intersectionObserver.unobserve(this.$el)
     this.intersectionObserver && this.intersectionObserver.disconnect()
     this.needObserver = false
     try {
       const isRange = (startTime && startTime.length > 0) && (endTime && endTime.length > 0)
       const data = await this.getSeriesData(startTime, endTime, isRange).catch(() => ({ series: [] }))
+      this.isFinish = data ? data[0] && data[0].isFinish : true
       !this.chart && this.initChart()
       if (!this.isEchartsRender
       || (Array.isArray(data) && data.length && data.some(item => item))
       || (data && Object.prototype.hasOwnProperty.call(data, 'series') && data.series.length)) {
-        await this.handleSetChartData(data)
+        // await this.handleSetChartData(data)
+        this.chartData.splice(0, this.chartData.length, ...data);
+        if (!this.isFold) this.handleSetChartData(this.chartData)
       } else {
-        this.noData = true
+        if (this.isFinish) {
+          this.noData = true
+        }
       }
     } catch (e) {
       console.info(e)
-      this.noData = true
+      // this.noData = true
     } finally {
       this.chartTitle = this.title
       this.chartSubTitle = this.subtitle
       this.loading = false
+      
+      if (this.isFinish) {
+        clearTimeout(this.timer)
+        return
+      }
+      this.timer = setTimeout(async () => {
+        this.handleSeriesData()
+      }, 500);
     }
   }
   handleTransformSeries(data) {
@@ -473,9 +516,17 @@ export default class MonitorEcharts extends Vue {
     const mapData = {}
     return {
       series: data.map(({ datapoints, target, ...item }) => {
+        const formatDataOpt = datapoints.map(data => {
+          if (data.indexOf(0) > -1) {
+            const res = data
+            res.splice(data.indexOf(0), 1, null)
+            return res
+          }
+          return data
+        })
         mapData[target] !== undefined ? (mapData[target] += 1) : (mapData[target] = 0)
         return { ...item,
-          data: datapoints.map(set => (Array.isArray(set) ? set.slice().reverse() : [])),
+          data: formatDataOpt.map(set => (Array.isArray(set) ? set.slice().reverse() : [])),
           name: !mapData[target] ? target : target + mapData[target]
         }
       })
@@ -517,6 +568,12 @@ export default class MonitorEcharts extends Vue {
         }
         setTimeout(() => {
           if (this.chart) {
+            const optSeries = optionData.options.series
+            const optData = optSeries[0] ? optSeries[0].data : []
+            const isEmptyData = optData.every(val => val.includes(null))
+
+            if (isEmptyData) optionData.options.yAxis.max = 1
+            
             this.chart.setOption(deepMerge(optionData.options, this.defaultOptions) as EChartOption, {
               notMerge: true,
               lazyUpdate: false,
@@ -537,6 +594,7 @@ export default class MonitorEcharts extends Vue {
                       this.chart.dispatchAction({
                         type: 'restore'
                       })
+                      this.handleCloseTimer()
                       await this.handleSeriesData(timeFrom, timeTo)
                     }
                     this.$emit('data-zoom', this.timeRange)
@@ -576,7 +634,8 @@ export default class MonitorEcharts extends Vue {
 
   // 设置tooltip
   handleSetTooltip(params) {
-    if (!params || params.length < 1 || params.every(item => item.value[1] === null)) {
+    // if (!params || params.length < 1 || params.every(item => item.value[1] === null)) {
+    if (!params || params.length < 1) {
       this.chartType === 'line' && (this.curValue = {
         color: '',
         name: '',
@@ -588,7 +647,10 @@ export default class MonitorEcharts extends Vue {
       return
     }
     const pointTime = moment(params[0].axisValue).format('YYYY-MM-DD HH:mm:ss')
-    const data = params.map(item => ({ color: item.color, seriesName: item.seriesName, value: item.value[1] }))
+    const data = params.map(item => {
+      const value = item.value[1] === null ? 0 : item.value[1]
+      return ({ color: item.color, seriesName: item.seriesName, value: value })
+    })
       .sort((a, b) => Math.abs(a.value - (+this.curValue.yAxis)) - Math.abs(b.value - (+this.curValue.yAxis)))
     const liHtmls = params.slice().sort((a, b) => b.value[1] - a.value[1])
       .map((item) => {
@@ -604,11 +666,11 @@ export default class MonitorEcharts extends Vue {
             yAxis: item.value[1]
           })
         }
-        if (item.value[1] === null) return ''
+        // if (item.value[1] === null) return ''
         const curSeries = this.curChartOption.series[item.seriesIndex]
         const unitFormater = curSeries.unitFormatter || (v => ({ text: v }))
         const precision = curSeries.unit !== 'none' && +curSeries?.precision < 1 ?  2 : +curSeries?.precision
-        const valueObj = unitFormater(item.value[1], precision)
+        const valueObj = unitFormater(item.value[1] === null ? 0 : item.value[1], precision)
         return `<li style="display: flex;align-items: center;">
            <span style="background-color:${item.color};margin-right: 4px;width: 6px;height: 6px; border-radius: 50%;"></span>
            <span style="${markColor} flex: 1;">${valueObj.text} ${valueObj.suffix || ''}</span>
@@ -721,12 +783,9 @@ export default class MonitorEcharts extends Vue {
   }
   // 图表的展开收起
   handleToggleExpand (isShow) {
-    this.isFold = isShow
-    this.$emit('toggle-expand', isShow)
-
-    if (this.initStatus) {
-      this.init()
+    if (!isShow && this.initStatus) {
       this.initStatus = false
+      this.handleSetChartData(this.chartData)
     }
   }
   handleSetYAxisSetScale(needScale) {
@@ -888,6 +947,7 @@ export default class MonitorEcharts extends Vue {
     color: #63656e;
     // padding-left: 10px;
     padding: 18px 24px 24px;
+    max-height: 153px;
 
     .echart-header {
       display: flex;

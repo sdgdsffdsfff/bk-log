@@ -21,18 +21,22 @@
   -->
 
 <template>
-  <trace-detail v-if="$route.query.traceId"></trace-detail>
-  <trace-index v-else></trace-index>
+  <trace-index></trace-index>
 </template>
 
 <script>
 import TraceIndex from './traceIndex';
-import TraceDetail from './traceDetail';
 
 export default {
+  name: 'trace',
   components: {
     TraceIndex,
-    TraceDetail,
   },
 };
 </script>
+
+<style scoped lang="scss">
+.trace-container {
+  height: 100%;
+}
+</style>

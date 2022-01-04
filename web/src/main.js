@@ -33,6 +33,30 @@ import VueJsonPretty from 'vue-json-pretty';
 import 'vue-json-pretty/lib/styles.css';
 import '@icon-cool/bk-icon-log_search';
 import cursor from '@/directives/cursor';
+import LogButton from '@/components/log-button';
+// 接入OTLP
+import { WebTracerProvider } from '@opentelemetry/web';
+import { registerInstrumentations } from '@opentelemetry/instrumentation';
+import { XMLHttpRequestInstrumentation } from '@opentelemetry/instrumentation-xml-http-request';
+import { ZoneContextManager } from '@opentelemetry/context-zone';
+
+const provider = new WebTracerProvider();
+
+provider.register({
+  contextManager: new ZoneContextManager(),
+});
+
+registerInstrumentations({
+  instrumentations: [new XMLHttpRequestInstrumentation(
+    {
+      // propagateTraceHeaderCorsUrls: new RegExp('.*'),
+    },
+  )],
+});
+
+const tracer = provider.getTracer('bk-log');
+
+Vue.prototype.tracer = tracer;
 
 try {
   const id = window.TAM_AEGIS_KEY;
@@ -52,7 +76,17 @@ try {
   console.warn('前端监控接入出错', e);
 }
 
+router.onError((err) => {
+  const pattern = /Loading (CSS chunk|chunk) (\d)+ failed/g;
+  const isChunkLoadFailed = err.message.match(pattern);
+  const targetPath = router.history.pending.fullPath;
+  if (isChunkLoadFailed) {
+    router.replace(targetPath);
+  }
+});
+
 Vue.component('VueJsonPretty', VueJsonPretty);
+Vue.component('LogButton', LogButton);
 Vue.directive('cursor', cursor);
 Vue.use(vClickOutside);
 Vue.use(methods);

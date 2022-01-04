@@ -52,6 +52,7 @@ import {
   bkMessage,
   bkNavigation,
   bkNavigationMenu,
+  bkNavigationMenuGroup,
   bkNavigationMenuItem,
   bkNotify,
   bkOption,
@@ -70,10 +71,12 @@ import {
   bkSlider,
   bkSteps,
   bkSwitcher,
+  bkTag,
   bkTab,
   bkTabPanel,
   bkTable,
   bkTableColumn,
+  bkTableSettingContent,
   bkTagInput,
   bkTimePicker,
   bkTimeline,
@@ -87,6 +90,8 @@ import {
   bkAnimateNumber,
   bkVirtualScroll,
   bkOverflowTips,
+  bkDivider,
+  bkSpin,
 } from 'bk-magic-vue';
 
 // bkDiff 组件体积较大且不是很常用，因此注释掉。如果需要，打开注释即可
@@ -112,6 +117,7 @@ Vue.use(bkFormItem);
 Vue.use(bkInput);
 Vue.use(bkNavigation);
 Vue.use(bkNavigationMenu);
+Vue.use(bkNavigationMenuGroup);
 Vue.use(bkNavigationMenuItem);
 Vue.use(bkOption);
 Vue.use(bkOptionGroup);
@@ -133,6 +139,8 @@ Vue.use(bkTab);
 Vue.use(bkTabPanel);
 Vue.use(bkTable);
 Vue.use(bkTableColumn);
+Vue.use(bkTableSettingContent);
+Vue.use(bkTag);
 Vue.use(bkTagInput);
 Vue.use(bkTimePicker);
 Vue.use(bkTimeline);
@@ -143,6 +151,7 @@ Vue.use(bkSwiper);
 Vue.use(bkRate);
 Vue.use(bkAnimateNumber);
 Vue.use(bkVirtualScroll);
+Vue.use(bkSpin);
 // bkDiff 组件体积较大且不是很常用，因此注释了。如果需要，打开注释即可
 // Vue.use(bkDiff)
 
@@ -150,6 +159,7 @@ Vue.use(bkVirtualScroll);
 Vue.use(bkClickoutside);
 Vue.use(bkTooltips);
 Vue.use(bkLoading);
+Vue.use(bkDivider);
 bkOverflowTips.setDefaultProps({
   delay: [400, 0],
 });

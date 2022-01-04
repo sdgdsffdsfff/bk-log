@@ -63,4 +63,26 @@ const footer = {
   method: 'get',
 };
 
-export { type, language, updateLanguage, scenario, menu, footer, getMaintainerApi };
+// 获取新人指引
+const getUserGuide = {
+  url: '/meta/user_guide/',
+  method: 'get',
+};
+
+// 更新新人指引
+const updateUserGuide = {
+  url: '/meta/update_user_guide/',
+  method: 'post',
+};
+
+export {
+  type,
+  language,
+  updateLanguage,
+  scenario,
+  menu,
+  footer,
+  getMaintainerApi,
+  getUserGuide,
+  updateUserGuide,
+};

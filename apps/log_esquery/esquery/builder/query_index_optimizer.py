@@ -38,6 +38,7 @@ class QueryIndexOptimizer(object):
         start_time: datetime = None,
         end_time: datetime = None,
         time_zone: str = None,
+        use_time_range: bool = True,
     ):
         self._index: str = ""
         if not indices:
@@ -51,12 +52,23 @@ class QueryIndexOptimizer(object):
             time_zone = "GMT" if scenario_id == Scenario.LOG else tz.gettz()
             result_table_id_list = self.index_filter(result_table_id_list, start_time, end_time, time_zone)
 
+        if not use_time_range:
+            result_table_id_list = []
+
         self._index = ",".join(result_table_id_list)
 
+        if not self._index:
+
+            map_func_map = {
+                Scenario.LOG: lambda x: f"{x}_*",
+                Scenario.BKDATA: lambda x: f"{x}*",
+                Scenario.ES: lambda x: f"{x}",
+            }
+            result_table_id_list: List[str] = map_if(indices.split(","), map_func_map.get(scenario_id))
+
+            self._index = ",".join(result_table_id_list)
         if scenario_id in [Scenario.LOG]:
             self._index = self._index.replace(".", "_")
-            return
-        self._index = self._index
 
     @property
     def index(self):
@@ -80,8 +92,13 @@ class QueryIndexOptimizer(object):
         now: datetime = arrow.now(time_zone).naive
         if parse(date_end) > now:
             date_end: str = now.strftime("%Y%m%d%H%M%S")
-        date_day_list: List[Any] = list(rrule(DAILY, interval=1, dtstart=parse(date_start), until=parse(date_end)))
-        date_month_list: List[Any] = list(rrule(DAILY, interval=14, dtstart=parse(date_start), until=parse(date_end)))
+
+        start, end = parse(date_start), parse(date_end)
+        date_day_list: List[Any] = list(rrule(DAILY, interval=1, dtstart=start, until=end))
+        # date_day_list.append(end)
+
+        date_month_list: List[Any] = list(rrule(DAILY, interval=14, dtstart=start, until=end))
+        # date_month_list.append(end)
 
         filter_list: type_index_set_list = self._generate_filter_list(
             index, date_day_list, date_month_list, date_end, now

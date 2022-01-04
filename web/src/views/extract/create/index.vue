@@ -29,7 +29,11 @@
       </div>
       <div class="content">
         <div class="flex-box">
-          <bk-button theme="primary" @click="showSelectDialog = true">{{ $t('选择服务器') }}</bk-button>
+          <bk-button
+            theme="primary"
+            @click="showSelectDialog = true"
+            data-test-id="addNewExtraction_button_selectTheServer"
+          >{{ $t('选择服务器') }}</bk-button>
           <div class="select-text">
             {{ $t('已选择') }}
             <span class="primary" v-if="ipList.length">{{ ipList.length }}</span>
@@ -84,7 +88,10 @@
       <div class="title">{{ $t('提取链路') }}</div>
       <div class="content">
         <!-- eslint-disable-next-line vue/camelcase -->
-        <bk-select v-model="link_id" style="width: 250px;margin-right: 20px;background-color: #fff;" :clearable="false">
+        <bk-select v-model="link_id"
+                   style="width: 250px;margin-right: 20px;background-color: #fff;"
+                   data-test-id="addNewExtraction_select_selectLink"
+                   :clearable="false">
           <bk-option
             v-for="link in extractLinks"
             :key="link.link_id"
@@ -97,11 +104,16 @@
     </div>
 
     <div class="button-container">
-      <bk-button theme="primary" style="margin-right: 16px;width: 120px;"
-                 :disabled="canSubmit" @click="handleSubmit">
+      <bk-button
+        theme="primary" style="margin-right: 16px;width: 120px;"
+        data-test-id="addNewExtraction_button_submitConfigure"
+        :disabled="canSubmit" @click="handleSubmit">
         {{ $t('提交下载任务') }}
       </bk-button>
-      <bk-button style="width: 120px;" @click="goToHome">{{ $t('取消') }}</bk-button>
+      <bk-button
+        style="width: 120px;" @click="goToHome"
+        data-test-id="addNewExtraction_button_cancel"
+      >{{ $t('取消') }}</bk-button>
     </div>
   </div>
 </template>
@@ -144,7 +156,7 @@ export default {
   },
   methods: {
     async checkIsClone() {
-      if (this.$route.query.clone && sessionStorage.getItem('cloneData')) {
+      if (this.$route.name === 'extract-clone' && sessionStorage.getItem('cloneData')) {
         const cloneData = JSON.parse(sessionStorage.getItem('cloneData'));
         sessionStorage.removeItem('cloneData');
 
@@ -223,7 +235,7 @@ export default {
     },
     goToHome() {
       this.$router.push({
-        name: 'extract',
+        name: 'log-extract-task',
         query: {
           projectId: window.localStorage.getItem('project_id'),
         },
@@ -234,61 +246,56 @@ export default {
 </script>
 
 <style lang="scss" scoped>
-  .create-task-container {
-    color: #63656e;
-
-    .row-container {
-      display: flex;
-      min-height: 40px;
-      margin: 20px 0 24px;
-
-      .title {
-        width: 128px;
-        margin-right: 16px;
+.create-task-container {
+  margin-top: 20px;
+  padding: 20px 24px;
+  background-color: #FFF;
+  color: #63656e;
+  border: 1px solid #dcdee5;
+  .row-container {
+    display: flex;
+    min-height: 40px;
+    margin: 20px 0 24px;
+    .title {
+      width: 128px;
+      margin-right: 16px;
+      font-size: 16px;
+      line-height: 40px;
+      font-size: 14px;
+      text-align: right;
+      .required {
         font-size: 16px;
-        line-height: 40px;
-        color: #313238;
-
-        .required {
-          font-size: 16px;
-          color: #ea3636;
-        }
-
-        .icon-info-fill {
-          color: #979ba5;
-          cursor: pointer;
-        }
+        color: #ea3636;
       }
-
-      .content {
+      .icon-info-fill {
+        color: #979ba5;
+        cursor: pointer;
+      }
+    }
+    .content {
+      display: flex;
+      flex-flow: column;
+      justify-content: center;
+      min-height: 40px;
+      .flex-box {
         display: flex;
-        flex-flow: column;
-        justify-content: center;
-        min-height: 40px;
-
-        .flex-box {
-          display: flex;
-          align-items: center;
-
-          .select-text {
-            margin-left: 12px;
-            font-size: 12px;
-            line-height: 16px;
-
-            .primary {
-              color: #3a84ff;
-            }
-
-            .error {
-              color: #ea3636;
-            }
+        align-items: center;
+        .select-text {
+          margin-left: 12px;
+          font-size: 12px;
+          line-height: 16px;
+          .primary {
+            color: #3a84ff;
+          }
+          .error {
+            color: #ea3636;
           }
         }
       }
     }
-
-    .button-container {
-      margin: 32px 0 0 144px;
-    }
   }
+  .button-container {
+    margin: 32px 0 0 144px;
+  }
+}
 </style>

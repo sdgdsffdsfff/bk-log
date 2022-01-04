@@ -17,19 +17,19 @@ NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
-import html
 import json
 import copy
-import datetime
-from datetime import timedelta
 import hashlib
 
-from typing import List, Dict, Any, Tuple, Union
-from dateutil.rrule import rrule
-from dateutil.rrule import MINUTELY
+from typing import List, Dict, Any, Union
 from django.core.cache import cache
 from django.conf import settings
+from requests.exceptions import ReadTimeout
 
+from apps.api.base import DataApiRetryClass
+from apps.log_clustering.models import ClusteringConfig
+from apps.log_databus.constants import EtlConfig, TargetNodeTypeEnum
+from apps.log_databus.models import CollectorConfig
 from apps.log_search.models import (
     LogIndexSet,
     LogIndexSetData,
@@ -43,9 +43,11 @@ from apps.log_search.constants import (
     MAX_RESULT_WINDOW,
     MAX_SEARCH_SIZE,
     BK_BCS_APP_CODE,
-    ASYNC_SORTED, FieldDataTypeEnum,
+    ASYNC_SORTED,
+    FieldDataTypeEnum,
+    MAX_EXPORT_REQUEST_RETRY,
+    DEFAULT_BK_CLOUD_ID,
 )
-from apps.log_search.handlers.es.es_query_mock_body import BODY_DATA_FOR_AGGS, BODY_DATA_FOR_ORIGIN_AGGS
 from apps.log_search.exceptions import (
     BaseSearchIndexSetException,
     BaseSearchIndexSetDataDoseNotExists,
@@ -58,6 +60,7 @@ from apps.log_search.exceptions import (
     SearchNotTimeFieldType,
 )
 
+from apps.feature_toggle.handlers.toggle import FeatureToggleObject
 from apps.api import BkLogApi, PaasCcApi
 from apps.utils.cache import cache_five_minute
 from apps.utils.db import array_group
@@ -70,7 +73,6 @@ from apps.log_search.handlers.es.dsl_bkdata_builder import (
 )
 from apps.log_search.handlers.es.indices_optimizer_context_tail import IndicesOptimizerContextTail
 from apps.utils.local import get_local_param
-from apps.utils.time_handler import generate_time_range
 from apps.log_search.handlers.biz import BizHandler
 from apps.log_search.handlers.search.mapping_handlers import MappingHandlers
 from apps.log_search.handlers.search.search_sort_builder import SearchSortBuilder
@@ -80,8 +82,26 @@ from apps.log_search.constants import TimeFieldTypeEnum, TimeFieldUnitEnum
 max_len_dict = Dict[str, int]
 
 
+def fields_config(name: str, is_active: bool = False):
+    def decorator(func):
+        def func_decorator(*args, **kwargs):
+            config = {"name": name, "is_active": is_active}
+            result = func(*args, **kwargs)
+            if isinstance(result, tuple):
+                config["is_active"], config["extra"] = result
+                return config
+            if result is None:
+                return config
+            config["is_active"] = result
+            return config
+
+        return func_decorator
+
+    return decorator
+
+
 class SearchHandler(object):
-    def __init__(self, index_set_id: int, search_dict: dict, pre_check_enable=True):
+    def __init__(self, index_set_id: int, search_dict: dict, pre_check_enable=True, can_highlight=True):
         self.search_dict: dict = search_dict
 
         # 透传查询类型
@@ -108,6 +128,7 @@ class SearchHandler(object):
         self.addition = copy.deepcopy(search_dict.get("addition", []))
         self.host_scopes = copy.deepcopy(search_dict.get("host_scopes", {}))
 
+        self.use_time_range = search_dict.get("use_time_range", True)
         # 构建时间字段
         self.time_field, self.time_field_type, self.time_field_unit = self._init_time_field(
             index_set_id, self.scenario_id
@@ -160,7 +181,7 @@ class SearchHandler(object):
         self.aggs: dict = self._init_aggs()
 
         # 初始化highlight
-        self.highlight: dict = self._init_highlight()
+        self.highlight: dict = self._init_highlight(can_highlight)
 
         # result fields
         self.field: Dict[str, max_len_dict] = {}
@@ -219,27 +240,116 @@ class SearchHandler(object):
             "time_field": self.time_field,
             "time_field_type": self.time_field_type,
             "time_field_unit": self.time_field_unit,
+            "config": [],
+        }
+        for fields_config in [
+            self.bcs_web_console(field_result_list),
+            self.bk_log_to_trace(),
+            self.analyze_fields(field_result),
+            self.bkmonitor(field_result_list),
+            self.async_export(field_result),
+            self.ip_topo_switch(),
+            self.clustering_config(),
+            self.clean_config(),
+        ]:
+            result_dict["config"].append(fields_config)
+
+        return result_dict
+
+    @fields_config("async_export")
+    def async_export(self, field_result):
+        result = MappingHandlers.async_export_fields(field_result, self.scenario_id)
+        if result["async_export_usable"]:
+            return True, {"fields": result["async_export_fields"]}
+        return False, {"usable_reason": result["async_export_usable_reason"]}
+
+    @fields_config("bkmonitor")
+    def bkmonitor(self, field_result_list):
+        if "ip" in field_result_list or "serverIp" in field_result_list:
+            return True
+
+    @fields_config("ip_topo_switch")
+    def ip_topo_switch(self):
+        return MappingHandlers.init_ip_topo_switch(self.index_set_id)
+
+    @fields_config("clustering_config")
+    def clustering_config(self):
+        """
+        判断聚类配置
+        """
+        log_index_set = LogIndexSet.objects.get(index_set_id=self.index_set_id)
+        clustering_config = ClusteringConfig.objects.filter(index_set_id=self.index_set_id).first()
+        if clustering_config:
+            return True, {
+                "collector_config_id": log_index_set.collector_config_id,
+                "signature_switch": clustering_config.signature_enable,
+                "clustering_field": clustering_config.clustering_fields,
+            }
+        return False, {"collector_config_id": None, "signature_switch": False, "clustering_field": None}
+
+    @fields_config("clean_config")
+    def clean_config(self):
+        """
+        获取清洗配置
+        """
+        log_index_set = LogIndexSet.objects.get(index_set_id=self.index_set_id)
+        if not log_index_set.collector_config_id:
+            return False, {"collector_config_id": None}
+        collector_config = CollectorConfig.objects.get(collector_config_id=log_index_set.collector_config_id)
+        return collector_config.etl_config != EtlConfig.BK_LOG_TEXT, {
+            "collector_scenario_id": collector_config.collector_scenario_id,
+            "collector_config_id": log_index_set.collector_config_id,
         }
 
-        if self._enable_bcs_manage():
-            if (
-                LogIndexSet.objects.get(index_set_id=self.index_set_id).source_app_code == BK_BCS_APP_CODE
-                and "cluster" in field_result_list
-                and "container_id" in field_result_list
-            ):
-                bcs_web_console_usable = True
-            else:
-                bcs_web_console_usable = False
-            result_dict.update({"bcs_web_console_usable": bcs_web_console_usable})
+    @fields_config("context_and_realtime")
+    def analyze_fields(self, field_result):
+        result = MappingHandlers.analyze_fields(field_result)
+        if result["context_search_usable"]:
+            return True, {"reason": ""}
+        return False, {"reason": result["usable_reason"]}
 
-        result_dict.update(MappingHandlers.analyze_fields(field_result))
-        ip_topo_switch = MappingHandlers.init_ip_topo_switch(self.index_set_id)
-        result_dict["bkmonitor_url"] = ""
-        if "ip" in field_result_list or "serverIp" in field_result_list:
-            result_dict["bkmonitor_url"] = settings.MONITOR_URL
-        result_dict.update({"ip_topo_switch": ip_topo_switch})
-        result_dict.update(MappingHandlers.async_export_fields(field_result, self.scenario_id))
-        return result_dict
+    @fields_config("bcs_web_console")
+    def bcs_web_console(self, field_result_list):
+        if not self._enable_bcs_manage():
+            return False
+        if (
+            LogIndexSet.objects.get(index_set_id=self.index_set_id).source_app_code == BK_BCS_APP_CODE
+            and "cluster" in field_result_list
+            and "container_id" in field_result_list
+        ):
+            return True
+        return False
+
+    @fields_config("trace")
+    def bk_log_to_trace(self):
+        """
+        [{
+            "log_config": [{
+                "index_set_id": 111,
+                "field": "span_id"
+            }],
+            "trace_config": {
+                "index_set_name": "xxxxxx"
+            }
+        }]
+        """
+        if not FeatureToggleObject.switch("bk_log_to_trace"):
+            return False
+        toggle = FeatureToggleObject.toggle("bk_log_to_trace")
+        feature_config = toggle.feature_config
+        if isinstance(feature_config, dict):
+            feature_config = [feature_config]
+
+        if not feature_config:
+            return False
+
+        for config in feature_config:
+            log_config = config.get("log_config", [])
+            target_config = [c for c in log_config if str(c["index_set_id"]) == str(self.index_set_id)]
+            if not target_config:
+                continue
+            target_config, *_ = target_config
+            return True, {**config.get("trace_config"), "field": target_config["field"]}
 
     def search(self, search_type="default"):
 
@@ -269,6 +379,7 @@ class SearchHandler(object):
                 "size": once_size,
                 "aggs": self.aggs,
                 "highlight": self.highlight,
+                "use_time_range": self.use_time_range,
                 "time_zone": self.time_zone,
                 "time_range": self.time_range,
                 "time_field": self.time_field,
@@ -378,12 +489,17 @@ class SearchHandler(object):
                     "highlight": self.highlight,
                     "time_zone": self.time_zone,
                     "time_range": self.time_range,
+                    "use_time_range": self.use_time_range,
                     "time_field": self.time_field,
                     "time_field_type": self.time_field_type,
                     "time_field_unit": self.time_field_unit,
                     "scroll": SCROLL,
                     "collapse": self.collapse,
-                }
+                },
+                data_api_retry_cls=DataApiRetryClass.create_retry_obj(
+                    ReadTimeout,
+                    stop_max_attempt_number=MAX_EXPORT_REQUEST_RETRY,
+                ),
             )
             return result
 
@@ -406,11 +522,15 @@ class SearchHandler(object):
                 "time_zone": self.time_zone,
                 "time_range": self.time_range,
                 "time_field": self.time_field,
+                "use_time_range": self.use_time_range,
                 "time_field_type": self.time_field_type,
                 "time_field_unit": self.time_field_unit,
                 "scroll": None,
                 "collapse": self.collapse,
-            }
+            },
+            data_api_retry_cls=DataApiRetryClass.create_retry_obj(
+                ReadTimeout, stop_max_attempt_number=MAX_EXPORT_REQUEST_RETRY
+            ),
         )
         return result
 
@@ -438,13 +558,17 @@ class SearchHandler(object):
                     "highlight": self.highlight,
                     "time_zone": self.time_zone,
                     "time_range": self.time_range,
+                    "use_time_range": self.use_time_range,
                     "time_field": self.time_field,
                     "time_field_type": self.time_field_type,
                     "time_field_unit": self.time_field_unit,
                     "scroll": self.scroll,
                     "collapse": self.collapse,
                     "search_after": search_after,
-                }
+                },
+                data_api_retry_cls=DataApiRetryClass.create_retry_obj(
+                    ReadTimeout, stop_max_attempt_number=MAX_EXPORT_REQUEST_RETRY
+                ),
             )
 
             search_after_size = len(search_result["hits"]["hits"])
@@ -463,7 +587,10 @@ class SearchHandler(object):
                     "storage_cluster_id": self.storage_cluster_id,
                     "scroll": SCROLL,
                     "scroll_id": _scroll_id,
-                }
+                },
+                data_api_retry_cls=DataApiRetryClass.create_retry_obj(
+                    ReadTimeout, stop_max_attempt_number=MAX_EXPORT_REQUEST_RETRY
+                ),
             )
             scroll_size = len(scroll_result["hits"]["hits"])
             result_size += scroll_size
@@ -488,7 +615,7 @@ class SearchHandler(object):
         url = (
             settings.BCS_WEB_CONSOLE_DOMAIN + "backend/web_console/projects/{project_id}/clusters/{cluster_id}/"
             "?container_id={container_id} ".format(
-                project_id=project_id, cluster_id=cluster_id, container_id=container_id
+                project_id=project_id, cluster_id=cluster_id.upper(), container_id=container_id
             )
         )
         return url
@@ -533,16 +660,37 @@ class SearchHandler(object):
         key_word = history["params"].get("keyword", "")
         if key_word is None:
             key_word = ""
-        query_string = "keyword:" + key_word
+        query_string = key_word
         # IP快选、过滤条件
         host_scopes = history["params"].get("host_scopes", {})
+
+        target_nodes = host_scopes.get("target_nodes", {})
+
+        if target_nodes:
+            if host_scopes["target_node_type"] == TargetNodeTypeEnum.INSTANCE.value:
+                query_string += " AND ({})".format(
+                    ",".join([f"{target_node['bk_cloud_id']}:{target_node['ip']}" for target_node in target_nodes])
+                )
+            else:
+                first_node, *_ = target_nodes
+                target_list = [str(target_node["bk_inst_id"]) for target_node in target_nodes]
+                query_string += f" AND ({first_node['bk_obj_id']}:" + ",".join(target_list) + ")"
 
         if host_scopes.get("modules"):
             modules_list = [str(_module["bk_inst_id"]) for _module in host_scopes["modules"]]
             query_string += " ADN (modules:" + ",".join(modules_list) + ")"
+            host_scopes["target_node_type"] = TargetNodeTypeEnum.TOPO.value
+            host_scopes["target_nodes"] = host_scopes["modules"]
+
         if host_scopes.get("ips"):
             query_string += " AND (ips:" + host_scopes["ips"] + ")"
+            host_scopes["target_node_type"] = TargetNodeTypeEnum.INSTANCE.value
+            host_scopes["target_nodes"] = [
+                {"ip": ip, "bk_cloud_id": DEFAULT_BK_CLOUD_ID} for ip in host_scopes["ips"].split(",")
+            ]
+
         additions = history["params"].get("addition", [])
+
         if additions:
             query_string += (
                 " AND ("
@@ -852,7 +1000,8 @@ class SearchHandler(object):
                     {"field": field, "value": "0", "operator": operator, "condition": condition, "type": _type}
                 )
 
-            if not field or not value or not operator:
+            # 此处对于前端传递filter为空字符串需要放行
+            if (not field or not value or not operator) and not isinstance(value, str):
                 continue
 
             new_filter_list.append(
@@ -925,22 +1074,11 @@ class SearchHandler(object):
 
         # 存在聚合参数，且时间聚合更新默认设置
         aggs_dict = self.search_dict["aggs"]
-        if aggs_dict.get("group_by_histogram"):
-            if self.scenario_id == Scenario.BKDATA:
-                date_histogram: dict = BODY_DATA_FOR_AGGS["docs_per_minute"]["date_histogram"]
-                BODY_DATA_FOR_AGGS["docs_per_minute"]["date_histogram"]["time_zone"] = self.time_zone
-            else:
-                date_histogram: dict = BODY_DATA_FOR_ORIGIN_AGGS["docs_per_minute"]["date_histogram"]
-                BODY_DATA_FOR_ORIGIN_AGGS["docs_per_minute"]["date_histogram"] = {
-                    "field": self.time_field,
-                    "time_zone": self.time_zone,
-                }
-
-            aggs_dict["group_by_histogram"]["date_histogram"].update(date_histogram)
         return aggs_dict
 
-    def _init_highlight(self):
-
+    def _init_highlight(self, can_highlight=True):
+        if not can_highlight:
+            return {}
         # 避免多字段高亮
         if self.query_string and ":" in self.query_string:
             require_field_match = True
@@ -972,29 +1110,19 @@ class SearchHandler(object):
 
     def _deal_query_result(self, result_dict: dict) -> dict:
         result: dict = {
-            "aggregations": result_dict.get("aggregations"),
+            "aggregations": result_dict.get("aggregations", {}),
         }
-
         # 将_shards 字段返回以供saas判断错误
-        _shards = result_dict.get("_shards")
+        _shards = result_dict.get("_shards", {})
         result.update({"_shards": _shards})
-
         log_list: list = []
         agg_result: dict = {}
-        top_ip_result: list = []
-        top_path_result: list = []
         origin_log_list: list = []
         if not result_dict.get("hits", {}).get("total"):
-            docs_per5_result: list = []
-            docs_per5_result = self.fix_agg_empty_pos(docs_per5_result)
-            agg_result.update(
-                {"docs_per_minute": docs_per5_result, "top_ip": top_ip_result, "top_path": top_path_result}
-            )
             result.update(
                 {"total": 0, "took": 0, "list": log_list, "aggs": agg_result, "origin_log_list": origin_log_list}
             )
             return result
-
         # hit data
         for hit in result_dict["hits"]["hits"]:
             log = hit["_source"]
@@ -1002,13 +1130,11 @@ class SearchHandler(object):
             origin_log_list.append(origin_log)
             _index = hit["_index"]
             log.update({"index": _index})
-            log = {k: self.xss_safe(v) for k, v in log.items()}
             if "highlight" not in hit:
                 log_list.append(log)
                 continue
             for key in hit["highlight"]:
                 log[key] = "".join(hit["highlight"][key])
-                log[key] = self.xss_safe(log[key])
             log_list.append(log)
 
         result.update(
@@ -1019,144 +1145,10 @@ class SearchHandler(object):
                 "origin_log_list": origin_log_list,
             }
         )
-
         # 处理聚合
-        agg_dict = result_dict.get("aggregations")
-        if agg_dict:
-            agg_result.update(self._format_aggregations_data(agg_dict))
-        else:
-            docs_per5_result: list = []
-            docs_per5_result = self.fix_agg_empty_pos(docs_per5_result)
-            agg_result.update(
-                {"docs_per_minute": docs_per5_result, "top_ip": top_ip_result, "top_path": top_path_result}
-            )
-        result.update({"aggs": agg_result})
-
+        agg_dict = result_dict.get("aggregations", {})
+        result.update({"aggs": agg_dict})
         return result
-
-    @staticmethod
-    def xss_safe(value):
-        if not isinstance(value, str):
-            return value
-        value = html.escape(value)
-        return value.replace("&lt;mark&gt;", "<mark>").replace("&lt;/mark&gt;", "</mark>")
-
-    def _format_aggregations_data(self, agg_dict):
-        agg_data = {}
-        top_ip_data = []
-        top_path_data = []
-        docs_per5_result = []
-
-        for _agg_key in agg_dict:
-
-            if _agg_key == "docs_per_minute":
-                docs_per_5miniuts_buckets_list = agg_dict.get("docs_per_minute")["buckets"]
-                for docs_per5 in docs_per_5miniuts_buckets_list:
-                    docs_per5_time = datetime.datetime.fromtimestamp(docs_per5["key"] / 1000)
-                    docs_per5_time_str = docs_per5_time.strftime("%Y-%m-%d %H:%M:%S")
-                    docs_per5_result.append((docs_per5_time_str, docs_per5["doc_count"]))
-                docs_per5_result = self.fix_agg_empty_pos(docs_per5_result)
-                agg_data.update({"docs_per_minute": docs_per5_result})
-                continue
-
-            if _agg_key == "top_ip":
-                top_ips_bucket_list = agg_dict.get("top_ip")["buckets"]
-                for top_ips_item in top_ips_bucket_list:
-                    top_ip_data.append((top_ips_item["key"], top_ips_item["doc_count"]))
-                agg_data.update({"top_ip": top_ip_data})
-                continue
-
-            if _agg_key == "top_path":
-                top_paths_bucket_list = agg_dict.get("top_path")["buckets"]
-                for top_path in top_paths_bucket_list:
-                    top_path_data.append((top_path["key"], top_path["doc_count"]))
-                agg_data.update({"top_path": top_path_data})
-                continue
-
-            if _agg_key == "group_by_histogram":
-                agg_data.update({"group_by_histogram": self._format_histogram_result(agg_dict, _agg_key)})
-                continue
-
-            agg_bucket_list = agg_dict.get(_agg_key)["buckets"]
-            bucket_result = [(_bucket["key"], _bucket["doc_count"]) for _bucket in agg_bucket_list]
-            agg_data.update({_agg_key: bucket_result})
-        return agg_data
-
-    def _format_histogram_result(self, agg_dict, agg_key):
-        """
-        填充key，保证每个bucket key一致
-        :param agg_dict:
-        :param agg_key:
-        :return:
-        """
-        agg_bucket_list = agg_dict[agg_key]["buckets"]
-        bucket_result = []
-        second_aggs = self.aggs[agg_key].get("aggs", {})
-        field_keys = self._get_bucket_keys(agg_bucket_list, second_aggs)
-
-        for _bucket in agg_bucket_list:
-            second_bucket_result = [(_agg, _bucket[_agg]["buckets"]) for _agg in second_aggs]
-            second_bucket_result = self._format_bucket_result(second_bucket_result, field_keys)
-            bucket_result.append((_bucket["key"], _bucket["doc_count"], _bucket["key_as_string"], second_bucket_result))
-        return bucket_result
-
-    @staticmethod
-    def _get_bucket_keys(agg_bucket_list, agg_fields):
-        """
-        查询每个聚合桶子key的取值范围
-        :param agg_bucket_list:
-        :param agg_fields:
-        :return:
-        """
-
-        agg_field_keys = {}
-        for _agg_bucket in agg_bucket_list:
-            for _field in agg_fields:
-                field_bucket = _agg_bucket.get(_field, {}).get("buckets", [])
-                field_keys = agg_field_keys.get(_field, [])
-                for _bucket in field_bucket:
-                    if _bucket["key"] not in field_keys:
-                        field_keys.append(_bucket["key"])
-                agg_field_keys.update({_field: field_keys})
-
-        return agg_field_keys
-
-    @staticmethod
-    def _format_bucket_result(bucket_result, field_keys):
-
-        for _result in bucket_result:
-            total_keys = field_keys.get(_result[0], [])
-            bucket_keys = [_bucket["key"] for _bucket in _result[1]]
-            to_add_keys = [_key for _key in total_keys if _key not in bucket_keys]
-
-            result_list = list(_result)
-            result_list[1] += [{"key": _key, "doc_count": 0} for _key in to_add_keys]
-            _result = tuple(result_list)
-        return bucket_result
-
-    def fix_agg_empty_pos(self, docs_per_result: List[tuple]) -> List:
-        new_result_list: List[Tuple] = []
-        not_empty_key_dict: dict = {}
-        for a_agg in docs_per_result:
-            agg_key, agg_value = a_agg
-            not_empty_key_dict.update({agg_key: agg_value})
-        time_range = self.time_range
-        start_time = self.start_time
-        end_time = self.end_time
-        time_zone = self.time_zone
-        time_start_end: Tuple = generate_time_range(time_range, start_time, end_time, time_zone)
-        start_time, end_time = time_start_end
-        minutes_list: list = list(rrule(MINUTELY, interval=1, dtstart=start_time.naive, until=end_time.naive))
-        if len(minutes_list) == 1:
-            minutes_list.append(minutes_list[0] + timedelta(minutes=1))
-        for a_minutes in minutes_list:
-            minute_str = a_minutes.strftime("%Y-%m-%d %H:%M:00")
-            minute_agg_count = not_empty_key_dict.get(minute_str)
-            if minute_agg_count:
-                new_result_list.append((minute_str, minute_agg_count))
-            else:
-                new_result_list.append((minute_str, 0))
-        return new_result_list
 
     def _analyze_field_length(self, log_list: List[Dict[str, Any]]):
         for item in log_list:
@@ -1292,14 +1284,29 @@ class SearchHandler(object):
             log_not_empty_list.append(a_item_dict)
         return log_not_empty_list
 
+    def _get_addition_host(self, bk_biz_id, target_node_type: str, target_nodes: list) -> list:
+        if target_node_type == TargetNodeTypeEnum.INSTANCE.value:
+            return target_nodes
+        conditions = [
+            {"bk_obj_id": node_obj["bk_obj_id"], "bk_inst_id": node_obj["bk_inst_id"]} for node_obj in target_nodes
+        ]
+        host_result = BizHandler(bk_biz_id).search_host(conditions)
+        return [{"ip": host["bk_host_innerip"], "bk_cloud_id": host["bk_cloud_id"]} for host in host_result]
+
     def _combine_addition_host_scope(self, attrs: dict):
         host_scopes_ip_list: list = []
         ips_list: list = []
         translated_ips: list = []
-
+        target_ips = []
         host_scopes: dict = attrs.get("host_scopes")
         if host_scopes:
             modules: list = host_scopes.get("modules")
+            target_nodes = host_scopes.get("target_nodes", {})
+            target_node_type = host_scopes.get("target_node_type", "")
+            if target_nodes:
+                target_ips = [
+                    host["ip"] for host in self._get_addition_host(attrs["bk_biz_id"], target_node_type, target_nodes)
+                ]
             if modules:
                 biz_handler = BizHandler(attrs["bk_biz_id"])
                 search_list: list = biz_handler.search_host(modules)
@@ -1310,11 +1317,8 @@ class SearchHandler(object):
             if ips:
                 ips_list = ips.split(",")
 
-        host_scopes_ip_list = host_scopes_ip_list + ips_list + translated_ips
-
-        tmp_tuple: tuple = self._deal_addition(attrs)
-        addition_ip_list: list = tmp_tuple[0]
-        new_addition: list = tmp_tuple[1]
+        host_scopes_ip_list = host_scopes_ip_list + ips_list + translated_ips + target_ips
+        addition_ip_list, new_addition = self._deal_addition(attrs)
 
         if addition_ip_list:
             search_ip_list = addition_ip_list
@@ -1358,7 +1362,8 @@ class SearchHandler(object):
             # 处理逗号分隔in类型查询
             value = _add.get("value")
             new_value: list = []
-            if value:
+            # 对于前端传递为空字符串的场景需要放行过去
+            if isinstance(value, str) or value:
                 new_value = self._deal_normal_addition(value, _operator)
             new_addition.append(
                 {

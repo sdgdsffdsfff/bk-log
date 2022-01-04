@@ -32,6 +32,8 @@ from apps.api import NodeApi, TransferApi
 from apps.api.modules.bk_node import BKNodeApi
 from apps.feature_toggle.handlers.toggle import FeatureToggleObject
 from apps.feature_toggle.plugins.constants import FEATURE_COLLECTOR_ITSM
+from apps.log_databus.handlers.collector_scenario.custom_define import get_custom
+from apps.utils.function import map_if
 from apps.utils.thread import MultiExecuteFunc
 from apps.constants import UserOperationTypeEnum, UserOperationActionEnum
 from apps.iam import ResourceEnum, Permission
@@ -66,19 +68,26 @@ from apps.log_databus.exceptions import (
     CollectorTaskRunningStatusException,
     CollectorCreateOrUpdateSubscriptionException,
     CollectorIllegalIPException,
+    CollectorConfigNameENDuplicateException,
 )
 from apps.log_databus.handlers.collector_scenario import CollectorScenario
 from apps.log_databus.handlers.etl_storage import EtlStorage
-from apps.log_databus.models import CollectorConfig
+from apps.log_databus.models import CollectorConfig, CleanStash
 from apps.log_search.handlers.biz import BizHandler
 from apps.log_search.handlers.index_set import IndexSetHandler
-from apps.log_search.constants import GlobalCategoriesEnum, CMDB_HOST_SEARCH_FIELDS
+from apps.log_search.constants import (
+    GlobalCategoriesEnum,
+    CMDB_HOST_SEARCH_FIELDS,
+    CollectorScenarioEnum,
+    CustomTypeEnum,
+)
 from apps.models import model_to_dict
 from apps.log_databus.handlers.kafka import KafkaConsumerHandle
 from apps.log_databus.constants import EtlConfig
 from apps.decorators import user_operation_record
 from apps.log_search.models import LogIndexSet, LogIndexSetData, Scenario
 from apps.utils.time_handler import format_user_time_zone
+from apps.log_databus.tasks.bkdata import async_create_bkdata_data_id
 
 
 class CollectorHandler(object):
@@ -92,27 +101,35 @@ class CollectorHandler(object):
             except CollectorConfig.DoesNotExist:
                 raise CollectorConfigNotExistException()
 
-    def _multi_info_get(self):
+    def _multi_info_get(self, use_request=True):
         # 并发查询所需的配置
         multi_execute_func = MultiExecuteFunc()
         if self.data.bk_data_id:
             multi_execute_func.append(
-                "data_id_config", TransferApi.get_data_id, params={"bk_data_id": self.data.bk_data_id}
+                "data_id_config",
+                TransferApi.get_data_id,
+                params={"bk_data_id": self.data.bk_data_id},
+                use_request=use_request,
             )
         if self.data.table_id:
             multi_execute_func.append(
-                "result_table_config", TransferApi.get_result_table, params={"table_id": self.data.table_id}
+                "result_table_config",
+                TransferApi.get_result_table,
+                params={"table_id": self.data.table_id},
+                use_request=use_request,
             )
             multi_execute_func.append(
                 "result_table_storage",
                 TransferApi.get_result_table_storage,
                 params={"result_table_list": self.data.table_id, "storage_type": "elasticsearch"},
+                use_request=use_request,
             )
         if self.data.subscription_id:
             multi_execute_func.append(
                 "subscription_config",
                 BKNodeApi.get_subscription_info,
                 params={"subscription_id_list": [self.data.subscription_id]},
+                use_request=use_request,
             )
         return multi_execute_func.run()
 
@@ -179,6 +196,7 @@ class CollectorHandler(object):
     def set_categorie_name(self, collector_config, context):
         # 分类名称
         collector_config["category_name"] = GlobalCategoriesEnum.get_display(collector_config["category_id"])
+        collector_config["custom_name"] = CustomTypeEnum.get_choice_label(collector_config["custom_type"])
         return collector_config
 
     def complement_metadata_info(self, collector_config, context):
@@ -244,12 +262,12 @@ class CollectorHandler(object):
         collector_config["created_at"] = format_user_time_zone(collector_config["created_at"], time_zone=time_zone)
         return collector_config
 
-    def retrieve(self):
+    def retrieve(self, use_request=True):
         """
         获取采集配置
         :return:
         """
-        context = self._multi_info_get()
+        context = self._multi_info_get(use_request)
         collector_config = model_to_dict(self.data)
         for process in self.RETRIEVE_CHAIN:
             collector_config = getattr(self, process, lambda x, y: x)(collector_config, context)
@@ -261,15 +279,27 @@ class CollectorHandler(object):
         return [node["bk_inst_id"] for node in nodes if node["bk_obj_id"] == node_type]
 
     @staticmethod
-    def add_cluster_info(data):
+    def bulk_cluster_infos(result_table_list: list):
+        multi_execute_func = MultiExecuteFunc()
+        for rt in result_table_list:
+            multi_execute_func.append(
+                rt, TransferApi.get_result_table_storage, {"result_table_list": rt, "storage_type": "elasticsearch"}
+            )
+        result = multi_execute_func.run()
+        cluster_infos = {}
+        for _, cluster_info in result.items():  # noqa
+            cluster_infos.update(cluster_info)
+        return cluster_infos
+
+    @classmethod
+    def add_cluster_info(cls, data):
         """
         补充集群信息
         """
         result_table_list = [_data["table_id"] for _data in data if _data.get("table_id")]
+        cluster_infos = {}
         try:
-            cluster_infos = TransferApi.get_result_table_storage(
-                {"result_table_list": ",".join(result_table_list), "storage_type": "elasticsearch"}
-            )
+            cluster_infos = cls.bulk_cluster_infos(result_table_list)
         except ApiError as error:
             logger.exception(f"request cluster info error => [{error}]")
             cluster_infos = {}
@@ -288,6 +318,7 @@ class CollectorHandler(object):
                 _data["table_id"] = table_id
             # 分类名
             _data["category_name"] = GlobalCategoriesEnum.get_display(_data["category_id"])
+            _data["custom_name"] = CustomTypeEnum.get_choice_label(_data["custom_type"])
 
             # 时间处理
             _data["created_at"] = (
@@ -319,6 +350,7 @@ class CollectorHandler(object):
     def only_create_or_update_model(self, params):
         model_fields = {
             "collector_config_name": params["collector_config_name"],
+            "collector_config_name_en": params["collector_config_name_en"],
             "target_object_type": params["target_object_type"],
             "target_node_type": params["target_node_type"],
             "target_nodes": params["target_nodes"],
@@ -329,6 +361,18 @@ class CollectorHandler(object):
         }
         # 判断是否存在非法IP列表
         self.cat_illegal_ips(params)
+        # 判断是否已存在同英文名collector
+        if self._pre_check_collector_config_en(model_fields=model_fields, bk_biz_id=params.get("bk_biz_id")):
+            logger.error(
+                "collector_config_name_en {collector_config_name_en} already exists".format(
+                    collector_config_name_en=model_fields["collector_config_name_en"]
+                )
+            )
+            raise CollectorConfigNameENDuplicateException(
+                CollectorConfigNameENDuplicateException.MESSAGE.format(
+                    collector_config_name_en=model_fields["collector_config_name_en"]
+                )
+            )
 
         is_create = False
         collect_config = self.data
@@ -382,8 +426,8 @@ class CollectorHandler(object):
         """
         if self.data and not self.data.is_active:
             raise CollectorActiveException()
-
         collector_config_name = params["collector_config_name"]
+        collector_config_name_en = params["collector_config_name_en"]
         target_object_type = params["target_object_type"]
         target_node_type = params["target_node_type"]
         target_nodes = params["target_nodes"]
@@ -394,6 +438,7 @@ class CollectorHandler(object):
         # 1. 创建CollectorConfig记录
         model_fields = {
             "collector_config_name": collector_config_name,
+            "collector_config_name_en": collector_config_name_en,
             "target_object_type": target_object_type,
             "target_node_type": target_node_type,
             "target_nodes": target_nodes,
@@ -406,6 +451,19 @@ class CollectorHandler(object):
         self.cat_illegal_ips(params)
 
         is_create = False
+
+        # 判断是否已存在同英文名collector
+        if self._pre_check_collector_config_en(model_fields=model_fields, bk_biz_id=params.get("bk_biz_id")):
+            logger.error(
+                "collector_config_name_en {collector_config_name_en} already exists".format(
+                    collector_config_name_en=collector_config_name_en
+                )
+            )
+            raise CollectorConfigNameENDuplicateException(
+                CollectorConfigNameENDuplicateException.MESSAGE.format(
+                    collector_config_name_en=collector_config_name_en
+                )
+            )
 
         # 2. 创建/更新采集项，并同步到bk_data_id
         with transaction.atomic():
@@ -447,8 +505,8 @@ class CollectorHandler(object):
                 )
 
                 bk_data_id = collector_scenario.update_or_create_data_id(
-                    self.data.bk_data_id,
-                    self.data.data_link_id,
+                    bk_data_id=self.data.bk_data_id,
+                    data_link_id=self.data.data_link_id,
                     data_name=f"{self.data.bk_biz_id}_{settings.TABLE_ID_PREFIX}_{collector_config_name}",
                     description=description,
                     encoding=META_DATA_ENCODING,
@@ -473,9 +531,13 @@ class CollectorHandler(object):
 
         if is_create:
             self._authorization_collector(self.data)
-        self._update_or_create_subscription(
-            collector_scenario=collector_scenario, params=params["params"], is_create=is_create
-        )
+        try:
+            self._update_or_create_subscription(
+                collector_scenario=collector_scenario, params=params["params"], is_create=is_create
+            )
+        finally:
+            # 创建数据平台data_id
+            async_create_bkdata_data_id.delay(self.data.collector_config_id)
 
         return {
             "collector_config_id": self.data.collector_config_id,
@@ -484,6 +546,17 @@ class CollectorHandler(object):
             "subscription_id": self.data.subscription_id,
             "task_id_list": self.data.task_id_list,
         }
+
+    def _pre_check_collector_config_en(self, model_fields: dict, bk_biz_id: int):
+        if not bk_biz_id:
+            bk_biz_id = self.data.bk_biz_id
+        qs = CollectorConfig.objects.filter(
+            collector_config_name_en=model_fields["collector_config_name_en"],
+            bk_biz_id=bk_biz_id,
+        )
+        if self.collector_config_id:
+            qs = qs.exclude(collector_config_id=self.collector_config_id)
+        return qs.exists()
 
     def _update_or_create_subscription(self, collector_scenario, params: dict, is_create=False):
         try:
@@ -614,6 +687,8 @@ class CollectorHandler(object):
         return True
 
     def _itsm_start_judge(self):
+        if self.data.collector_scenario_id == CollectorScenarioEnum.CUSTOM.value:
+            return
         if not self.data.itsm_has_success() and FeatureToggleObject.switch(name=FEATURE_COLLECTOR_ITSM):
             raise CollectNotSuccessNotCanStart
 
@@ -656,12 +731,21 @@ class CollectorHandler(object):
             return self._run_subscription_task("STOP")
         return True
 
+    @classmethod
+    def _get_kafka_broker(cls, broker_url):
+        """
+        判断是否为内网域名
+        """
+        if "consul" in broker_url and settings.DEFAULT_KAFKA_HOST:
+            return settings.DEFAULT_KAFKA_HOST
+        return broker_url
+
     def tail(self):
         if not self.data.bk_data_id:
             raise CollectorConfigDataIdNotExistException()
         data_result = TransferApi.get_data_id({"bk_data_id": self.data.bk_data_id})
         params = {
-            "server": settings.DEFAULT_KAFKA_HOST or data_result["mq_config"]["cluster_config"]["domain_name"],
+            "server": self._get_kafka_broker(data_result["mq_config"]["cluster_config"]["domain_name"]),
             "port": data_result["mq_config"]["cluster_config"]["port"],
             "topic": data_result["mq_config"]["storage_config"]["topic"],
             "username": data_result["mq_config"]["auth_info"]["username"],
@@ -1311,8 +1395,8 @@ class CollectorHandler(object):
         :return:
         """
         param = {"subscription_id_list": [self.data.subscription_id]}
-        status_result = NodeApi.get_subscription_instance_status(param)
-        instance_status = self.format_subscription_instance_status(status_result[0])
+        status_result, *_ = NodeApi.get_subscription_instance_status(param)
+        instance_status = self.format_subscription_instance_status(status_result)
 
         # 如果采集目标是HOST-INSTANCE
         if self.data.target_node_type == TargetNodeTypeEnum.INSTANCE.value:
@@ -1532,3 +1616,191 @@ class CollectorHandler(object):
         legal_ip_set = {legal_ip["bk_host_innerip"] for legal_ip in legal_ip_list}
 
         return [ip for ip in ip_list if ip not in legal_ip_set]
+
+    def get_clean_stash(self):
+        clean_stash = CleanStash.objects.filter(collector_config_id=self.collector_config_id).first()
+        if not clean_stash:
+            return None
+        return model_to_dict(CleanStash.objects.filter(collector_config_id=self.collector_config_id).first())
+
+    def create_clean_stash(self, params: dict):
+        model_fields = {
+            "clean_type": params["clean_type"],
+            "etl_params": params["etl_params"],
+            "etl_fields": params["etl_fields"],
+            "collector_config_id": int(self.collector_config_id),
+            "bk_biz_id": params["bk_biz_id"],
+        }
+        CleanStash.objects.filter(collector_config_id=self.collector_config_id).delete()
+        logger.info("delete clean stash {}".format(self.collector_config_id))
+        return model_to_dict(CleanStash.objects.create(**model_fields))
+
+    def list_collector(self, bk_biz_id):
+        return [
+            {
+                "collector_config_id": collector.collector_config_id,
+                "collector_config_name": collector.collector_config_name,
+            }
+            for collector in CollectorConfig.objects.filter(bk_biz_id=bk_biz_id)
+        ]
+
+    def custom_create(
+        self,
+        bk_biz_id=None,
+        collector_config_name=None,
+        collector_config_name_en=None,
+        data_link_id=None,
+        custom_type=None,
+        category_id=None,
+        description=None,
+        storage_cluster_id=None,
+        retention=7,
+        allocation_min_days=0,
+        storage_replies=1,
+    ):
+        collector_config_params = {
+            "bk_biz_id": bk_biz_id,
+            "collector_config_name": collector_config_name,
+            "collector_config_name_en": collector_config_name_en,
+            "collector_scenario_id": CollectorScenarioEnum.CUSTOM.value,
+            "custom_type": custom_type,
+            "category_id": category_id,
+            "description": description or collector_config_name,
+            "data_link_id": int(data_link_id) if data_link_id else 0,
+        }
+        # 判断是否已存在同英文名collector
+        if self._pre_check_collector_config_en(model_fields=collector_config_params, bk_biz_id=bk_biz_id):
+            logger.error(
+                "collector_config_name_en {collector_config_name_en} already exists".format(
+                    collector_config_name_en=collector_config_name_en
+                )
+            )
+            raise CollectorConfigNameENDuplicateException(
+                CollectorConfigNameENDuplicateException.MESSAGE.format(
+                    collector_config_name_en=collector_config_name_en
+                )
+            )
+
+        with transaction.atomic():
+            try:
+                self.data = CollectorConfig.objects.create(**collector_config_params)
+            except IntegrityError:
+                logger.warning(f"collector config name duplicate => [{collector_config_name}]")
+                raise CollectorConfigNameDuplicateException()
+
+            collector_scenario = CollectorScenario.get_instance(CollectorScenarioEnum.CUSTOM.value)
+            self.data.bk_data_id = collector_scenario.update_or_create_data_id(
+                bk_data_id=self.data.bk_data_id,
+                data_link_id=self.data.data_link_id,
+                data_name=f"{self.data.bk_biz_id}_{settings.TABLE_ID_PREFIX}_{collector_config_name}",
+                description=collector_config_params["description"],
+                encoding=META_DATA_ENCODING,
+            )
+            self.data.save()
+
+        # add user_operation_record
+        operation_record = {
+            "username": get_request_username(),
+            "biz_id": self.data.bk_biz_id,
+            "record_type": UserOperationTypeEnum.COLLECTOR,
+            "record_object_id": self.data.collector_config_id,
+            "action": UserOperationActionEnum.CREATE,
+            "params": model_to_dict(self.data, exclude=["deleted_at", "created_at", "updated_at"]),
+        }
+        user_operation_record.delay(operation_record)
+
+        self._authorization_collector(self.data)
+        # 创建数据平台data_id
+        async_create_bkdata_data_id.delay(self.data.collector_config_id)
+
+        custom_config = get_custom(custom_type)
+        from apps.log_databus.handlers.etl import EtlHandler
+
+        etl_handler = EtlHandler(self.data.collector_config_id)
+        etl_params = {
+            "table_id": collector_config_name_en,
+            "storage_cluster_id": storage_cluster_id,
+            "retention": retention,
+            "allocation_min_days": allocation_min_days,
+            "storage_replies": storage_replies,
+            "etl_params": custom_config.etl_params,
+            "etl_config": custom_config.etl_config,
+            "fields": custom_config.fields,
+        }
+        self.data.index_set_id = etl_handler.update_or_create(**etl_params)["index_set_id"]
+        custom_config.after_hook(self.data)
+        return {
+            "collector_config_id": self.data.collector_config_id,
+            "index_set_id": self.data.index_set_id,
+            "bk_data_id": self.data.bk_data_id,
+        }
+
+    def custom_update(
+        self,
+        collector_config_name=None,
+        category_id=None,
+        description=None,
+        storage_cluster_id=None,
+        retention=7,
+        allocation_min_days=0,
+        storage_replies=1,
+    ):
+
+        collector_config_update = {
+            "collector_config_name": collector_config_name,
+            "category_id": category_id,
+            "description": description or collector_config_name,
+        }
+        for key, value in collector_config_update.items():
+            setattr(self.data, key, value)
+        try:
+            self.data.save()
+        except IntegrityError:
+            logger.warning(f"collector config name duplicate => [{collector_config_name}]")
+            raise CollectorConfigNameDuplicateException()
+
+        # collector_config_name更改后更新索引集名称
+        if collector_config_name != self.data.collector_config_name and self.data.index_set_id:
+            index_set_name = _("[采集项]") + self.data.collector_config_name
+            LogIndexSet.objects.filter(index_set_id=self.data.index_set_id).update(index_set_name=index_set_name)
+
+        custom_config = get_custom(self.data.custom_type)
+        etl_params = custom_config.etl_config
+        etl_config = custom_config.etl_config
+        fields = custom_config.fields
+        if custom_config.etl_config != self.data.etl_config:
+            collector_detail = self.retrieve()
+            # need drop built in field
+            collector_detail["fields"] = map_if(
+                collector_detail["fields"], if_func=lambda field: not field["is_built_in"]
+            )
+            etl_params = collector_detail["etl_params"]
+            etl_config = collector_detail["etl_config"]
+            fields = collector_detail["fields"]
+
+        from apps.log_databus.handlers.etl import EtlHandler
+
+        etl_handler = EtlHandler(self.data.collector_config_id)
+        etl_params = {
+            "table_id": self.data.collector_config_name_en,
+            "storage_cluster_id": storage_cluster_id,
+            "retention": retention,
+            "allocation_min_days": allocation_min_days,
+            "storage_replies": storage_replies,
+            "etl_params": etl_params,
+            "etl_config": etl_config,
+            "fields": fields,
+        }
+        etl_handler.update_or_create(**etl_params)
+        custom_config.after_hook(self.data)
+
+        # add user_operation_record
+        operation_record = {
+            "username": get_request_username(),
+            "biz_id": self.data.bk_biz_id,
+            "record_type": UserOperationTypeEnum.COLLECTOR,
+            "record_object_id": self.data.collector_config_id,
+            "action": UserOperationActionEnum.UPDATE,
+            "params": model_to_dict(self.data, exclude=["deleted_at", "created_at", "updated_at"]),
+        }
+        user_operation_record.delay(operation_record)

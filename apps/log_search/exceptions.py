@@ -358,7 +358,7 @@ class DateHistogramException(BaseException):
 
 class MissAsyncExportException(BaseException):
     ERROR_CODE = "501"
-    MESSAGE = _("对应索引集{index_set_id}缺少异步导出必备fields")
+    MESSAGE = _("对应索引集缺少异步导出必备fields{}")
 
 
 class OverAsyncExportMaxCount(BaseException):
@@ -389,3 +389,8 @@ class BkJwtVerifyException(BasePermException):
 class BkJwtVerifyFailException(BasePermException):
     ERROR_CODE = "903"
     MESSAGE = _("JWT校验失败")
+
+
+class SettingMenuException(BasePermException):
+    ERROR_CODE = "1001"
+    MESSAGE = _("配置中menu对象异常")

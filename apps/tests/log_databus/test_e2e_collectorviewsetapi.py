@@ -114,6 +114,8 @@ COLLECTORS_LIST = {
                 "is_deleted": False,
                 "deleted_at": None,
                 "deleted_by": None,
+                "custom_type": "log",
+                "custom_name": "容器日志上报",
                 "collector_config_name": "test3333",
                 "bk_app_code": "bk_log_search",
                 "collector_scenario_id": "row",
@@ -143,11 +145,14 @@ COLLECTORS_LIST = {
                 "storage_shards_size": None,
                 "storage_replies": 1,
                 "bkdata_data_id_sync_times": 0,
+                "collector_config_name_en": "",
                 "storage_cluster_id": 1,
                 "storage_cluster_name": "",
                 "table_id_prefix": "2_bklog_",
                 "is_search": False,
                 "permission": {"search_log": True},
+                "create_clean_able": True,
+                "bkdata_index_set_ids": [],
             }
         ],
     },
@@ -171,6 +176,7 @@ class TestCollectorViewSetAPI(TestCase):
         测试 api.v1.databus.collectors
         """
         # 测试数据库添加一条CollectorConfig数据
+        self.maxDiff = 500000
         CollectorConfig.objects.create(
             collector_config_id=COLLECTOR_CONFIG_ID,
             collector_config_name="test3333",

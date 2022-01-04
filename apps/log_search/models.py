@@ -27,7 +27,10 @@ from django.utils.html import format_html
 from django_jsonfield_backport.models import JSONField
 from jinja2 import Environment, FileSystemLoader
 
+from apps.exceptions import BizNotExistError
 from apps.feature_toggle.handlers.toggle import feature_switch
+from apps.log_clustering.constants import PatternEnum, YearOnYearEnum
+from apps.log_databus.constants import EsSourceType
 from apps.log_search.exceptions import (
     SourceDuplicateException,
     IndexSetNameDuplicateException,
@@ -60,6 +63,8 @@ from apps.log_search.constants import (
     DEFAULT_TIME_FIELD,
     EncodingsEnum,
     TagColor,
+    InnerTag,
+    CustomTypeEnum,
 )
 
 
@@ -111,7 +116,13 @@ class GlobalConfig(models.Model):
         configs[GlobalTypeEnum.TIME_FIELD_UNIT.value] = TimeFieldUnitEnum.get_choices_list_dict()
         # 日志编码
         configs[GlobalTypeEnum.DATA_ENCODING.value] = EncodingsEnum.get_choices_list_dict()
-
+        # ES日志来源类型
+        configs[GlobalTypeEnum.ES_SOURCE_TYPE.value] = EsSourceType.get_choices_list_dict()
+        # 日志聚类
+        configs[GlobalTypeEnum.LOG_CLUSTERING_LEVEL.value] = PatternEnum.get_choices()
+        configs[GlobalTypeEnum.LOG_CLUSTERING_YEAR_ON_YEAR.value] = YearOnYearEnum.get_choices_list_dict()
+        # 自定义上报
+        configs[GlobalTypeEnum.DATABUS_CUSTOM.value] = CustomTypeEnum.get_choices_list_dict()
         return configs
 
     class Meta:
@@ -194,6 +205,15 @@ class ProjectInfo(SoftDeleteModel):
                 continue
             feature_toggles.append(item.strip())
         return feature_toggles
+
+    @classmethod
+    def get_biz(cls, biz_id=None):
+        try:
+            project = ProjectInfo.objects.get(bk_biz_id=biz_id)
+        except ProjectInfo.DoesNotExist:
+            raise BizNotExistError(BizNotExistError.MESSAGE.format(bk_biz_id=biz_id))
+
+        return {"bk_biz_id": project.bk_biz_id, "bk_biz_name": project.project_name}
 
     class Meta:
         verbose_name = _("项目列表")
@@ -283,7 +303,6 @@ class LogIndexSet(SoftDeleteModel):
     pre_check_tag = models.BooleanField(_("是否通过"), default=True)
     pre_check_msg = models.TextField(_("预查询描述"), null=True)
     is_active = models.BooleanField(_("是否可用"), default=True)
-
     # 字段快照
     fields_snapshot = JsonField(_("字段快照"), default=None, null=True)
 
@@ -477,6 +496,7 @@ class LogIndexSet(SoftDeleteModel):
         try:
             search_handler_esquery = SearchHandler(self.index_set_id, {}, pre_check_enable=pre_check_enable)
             fields = search_handler_esquery.fields()
+            fields = self.fields_to_string(fields=fields)
             self.fields_snapshot = fields
         except Exception as e:  # pylint: disable=broad-except
             # 如果字段获取失败，则不修改原来的值
@@ -498,6 +518,11 @@ class LogIndexSet(SoftDeleteModel):
         index_set.save()
 
     @classmethod
+    def delete_tag_by_name(cls, index_set_id, tag_name):
+        delete_tag_id = IndexSetTag.get_tag_id(tag_name)
+        cls.delete_tag(index_set_id, delete_tag_id)
+
+    @classmethod
     @atomic
     def delete_tag(cls, index_set_id, *tag_ids):
         index_set = cls.objects.select_for_update().get(index_set_id=index_set_id)
@@ -512,6 +537,15 @@ class LogIndexSet(SoftDeleteModel):
 
     def cancel_favorite(self, username: str):
         IndexSetUserFavorite.cancel(username, self.index_set_id)
+
+    @staticmethod
+    def fields_to_string(fields):
+        """
+        translate __proxy__ obj usable_reason to str
+        @params fields {dict}
+        """
+        fields["usable_reason"] = str(fields.get("usable_reason", ""))
+        return fields
 
     class Meta:
         ordering = ("-orders", "-index_set_id")
@@ -716,7 +750,11 @@ class IndexSetTag(models.Model):
 
     @classmethod
     def batch_get_tags(cls, tag_ids: list):
-        return cls.objects.filter(tag_id__in=tag_ids).values("name", "color", "tag_id")
+        tags = cls.objects.filter(tag_id__in=tag_ids).values("name", "color", "tag_id")
+        return [
+            {"name": InnerTag.get_choice_label(tag["name"]), "color": tag["color"], "tag_id": tag["tag_id"]}
+            for tag in tags
+        ]
 
 
 class AsyncTask(OperateRecordModel):
@@ -778,3 +816,14 @@ class EmailTemplate(OperateRecordModel):
     class Meta:
         verbose_name = _("邮件模板")
         verbose_name_plural = _("43_邮件模板")
+
+
+class UserMetaConf(models.Model):
+    username = models.CharField(_("创建者"), max_length=32, default="")
+    conf = JSONField(_("用户meta配置"), default=dict)
+    type = models.CharField(_("数据类型"), max_length=64)
+
+    class Meta:
+        verbose_name = _("用户元配置")
+        verbose_name_plural = _("44_用户元配置")
+        unique_together = (("username", "type"),)

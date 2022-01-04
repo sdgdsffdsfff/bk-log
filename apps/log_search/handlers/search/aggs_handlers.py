@@ -68,6 +68,7 @@ class AggsHandlers(AggsBase):
         :return:
         """
         # 组合聚合查询字段
+        query_data = copy.deepcopy(query_data)
         s = Search()
         s = cls._build_terms_aggs(
             s,
@@ -102,11 +103,43 @@ class AggsHandlers(AggsBase):
 
     @classmethod
     def _build_terms_bucket(cls, aggs, field: str, size: int, order: dict) -> Search:
-        terms = A("terms", field=field, size=size, order=order)
-        return aggs.bucket(field, terms)
+        sub_aggs = {}
+        field_name = field
+        if isinstance(field, dict):
+            field_name = field.get("field_name")
+            sub_fields = field.get("sub_fields")
+            if sub_fields:
+                sub_aggs = cls._build_sub_terms_fields(sub_fields, size, order)
+        terms = A("terms", field=field_name, size=size, order=order, aggs=sub_aggs)
+        return aggs.bucket(field_name, terms)
+
+    @classmethod
+    def _build_sub_terms_fields(cls, sub_fields, size: int, order: dict):
+        if not sub_fields:
+            return
+        if isinstance(sub_fields, dict):
+            sub_fields = [sub_fields]
+        aggs = {}
+        for sub_field in sub_fields:
+            field_name = sub_field
+            if isinstance(sub_field, dict):
+                field_name = sub_field.get("field_name")
+                sub_fields = sub_field.get("sub_fields")
+                if sub_fields:
+                    aggs[field_name] = A(
+                        "terms",
+                        field=field_name,
+                        size=size,
+                        order=order,
+                        aggs=cls._build_sub_terms_fields(sub_fields, size, order),
+                    )
+                    continue
+            aggs[field_name] = A("terms", field=field_name, size=size, order=order)
+        return aggs
 
     @classmethod
     def date_histogram(cls, index_set_id, query_data: dict):
+        query_data = copy.deepcopy(query_data)
         s = Search()
         # 按照日期时间聚合
         interval = query_data.get("interval")
@@ -175,7 +208,9 @@ class AggsHandlers(AggsBase):
         return s
 
     @classmethod
-    def _build_not_level_date_histogram_aggs(cls, s: Search, field, size: int) -> Search:  # pylint: disable=function-name-too-long
+    def _build_not_level_date_histogram_aggs(
+        cls, s: Search, field, size: int
+    ) -> Search:  # pylint: disable=function-name-too-long
         cls._build_date_histogram_aggs_item(
             s, field.get("term_filed"), field.get("metric_type"), field.get("metric_field"), size
         )
@@ -200,18 +235,20 @@ class AggsViewAdapter(object):
         terms_data = defaultdict(dict)
 
         for _field in query_data["fields"]:
-            file_agg_result = aggs_result.get(_field)
-            if not file_agg_result:
+            field_agg_result = aggs_result.get(_field)
+            if not field_agg_result:
                 terms_data["aggs"].update({_field: []})
                 terms_data["aggs_items"].update({_field: []})
                 continue
-            terms_data["aggs"].update({_field: file_agg_result})
-            terms_data["aggs_items"].update({_field: list(zip(*file_agg_result))[0]})
+            terms_data["aggs"].update({_field: field_agg_result})
+            terms_data["aggs_items"].update(
+                {_field: list(map(lambda item: item.get("key"), field_agg_result.get("buckets", [])))}
+            )
         return terms_data
 
     def date_histogram(self, index_set_id, query_data: dict):
         histogram_result = self._aggs_handlers.date_histogram(index_set_id, query_data)
-        histogram_data = histogram_result.get("aggs", {}).get("group_by_histogram", [])
+        histogram_data = histogram_result.get("aggs", {}).get("group_by_histogram", {})
         # 当返回的数据为空且包含failures字段时报错
         failures = histogram_result.get("_shards", {}).get("failures")
         if failures:
@@ -233,15 +270,14 @@ class AggsViewAdapter(object):
 
         histogram_dict = {}
         labels = []
-        for _data in histogram_data:
+        for _data in histogram_data.get("buckets", []):
 
             # labels 横坐标时间轴
-            if _data[2] not in labels:
-                labels.append(_data[2])
+            labels.append(_data.get("key_as_string"))
 
             # filed 查询结果
-            for _filed in _data[3]:
-                _filed_key = _filed[0]
+            for field in agg_fields.keys():
+                _filed_key = field
                 filed_data_dict = histogram_dict.get(_filed_key, {}).get("datasets", {})
 
                 # 获取需要返回的指标key,如：doc_count, avg_key
@@ -251,7 +287,8 @@ class AggsViewAdapter(object):
                     metric_key = _filed_key
 
                 # doc: key, count
-                for _doc in _filed[1]:
+                buckets = _data.get(field, {}).get("buckets", [])
+                for _doc in buckets:
 
                     # 获取指标值和doc_count
                     if metric_key == "doc_count":
@@ -265,11 +302,11 @@ class AggsViewAdapter(object):
                         filed_data_dict.update(
                             {
                                 doc_key: {
-                                    "label": doc_key,
+                                    "label": _doc.get("key"),
                                     "data": [
                                         {
                                             "label": timestamp_to_timeformat(
-                                                _data[0], time_multiplicator=DTEVENTTIMESTAMP_MULTIPLICATOR
+                                                _data.get("key"), time_multiplicator=DTEVENTTIMESTAMP_MULTIPLICATOR
                                             ),
                                             "value": doc_value,
                                             "count": doc_count,
@@ -282,7 +319,7 @@ class AggsViewAdapter(object):
                         filed_data_dict[doc_key]["data"].append(
                             {
                                 "label": timestamp_to_timeformat(
-                                    _data[0], time_multiplicator=DTEVENTTIMESTAMP_MULTIPLICATOR
+                                    _data.get("key"), time_multiplicator=DTEVENTTIMESTAMP_MULTIPLICATOR
                                 ),
                                 "value": doc_value,
                                 "count": doc_count,

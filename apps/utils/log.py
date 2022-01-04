@@ -17,6 +17,9 @@ NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
+from logging.handlers import DatagramHandler
+from opentelemetry import trace
+from opentelemetry.trace import format_trace_id
 
 """
 Usage:
@@ -38,6 +41,15 @@ import logging  # noqa
 from apps.utils.local import get_request_id  # noqa
 
 logger_detail = logging.getLogger("root")
+
+
+class UdpHandler(DatagramHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.send(msg.encode())
+        except Exception:
+            self.handleError(record)
 
 
 # ===============================================================================
@@ -93,8 +105,8 @@ class logger_traceback:
 
     @staticmethod
     def build_message(message):
-        request_id = get_request_id()
-        return "{} | {}".format(request_id, message)
+        trace_id = trace.get_current_span().get_span_context().trace_id
+        return "{} | {}".format(format_trace_id(trace_id), message)
 
 
 # traceback--打印详细错误日志
